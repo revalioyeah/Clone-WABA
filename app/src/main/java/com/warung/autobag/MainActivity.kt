@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.widget.Button
 import android.widget.CheckBox
@@ -44,13 +45,16 @@ class MainActivity : Activity() {
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REFERENCE_IMAGE_WIDTH = 2304f
         private const val MAX_VERIFICATION_ATTEMPTS = 3
-        private const val FIRST_VERIFICATION_DELAY_MS = 300L
+        private const val MAX_CAPTURE_WAIT_MS = 1_800L
+        private const val FRAME_POLL_INTERVAL_MS = 60L
+        private const val COMPLETED_IDENTITY_SCAN_INTERVAL_MS = 1_200L
+        private const val FIRST_VERIFICATION_DELAY_MS = 120L
         private const val GAME_SWITCH_DELAY_MS = 1_500L
-        private const val CONTINUOUS_MONITOR_INTERVAL_MS = 300L
-        private const val CONTINUOUS_IDLE_RETRY_MS = 450L
+        private const val CONTINUOUS_MONITOR_INTERVAL_MS = 180L
+        private const val CONTINUOUS_IDLE_RETRY_MS = 300L
         private const val CONTINUOUS_STABLE_FRAME_COUNT = 2
-        private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 4
-        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 300L
+        private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 6
+        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 180L
     }
 
     private lateinit var statusText: TextView
@@ -82,6 +86,7 @@ class MainActivity : Activity() {
     private var continuousMonitorRunnable: Runnable? = null
     private var continuousScanInFlight = false
     private var lastContinuousFrameModifiedAt = 0L
+    private var lastCompletedIdentityScanAt = 0L
     private var candidateCustomerSignature: String? = null
     private var candidateStableFrameCount = 0
     private var panelAbsentFrameCount = 0
@@ -97,7 +102,8 @@ class MainActivity : Activity() {
         val expectedQuantity: Int,
         val requiredQuantity: Int,
         var attempts: Int,
-        var lastCaptureModified: Long
+        var lastCaptureModified: Long,
+        val startedAtElapsedMs: Long
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -385,10 +391,10 @@ class MainActivity : Activity() {
                         lastServedCustomerSignature = activeCustomerSignature
                         autoPausedAwaitingPanel = false
                         if (continuousModeEnabled) {
-                            scheduleContinuousMonitor(250L)
+                            scheduleContinuousMonitor(180L)
                         }
                     } else if (snapshot.state == OrderExecutionManager.State.PAUSED && continuousModeEnabled) {
-                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(300L)
+                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(180L)
                     } else if (snapshot.state == OrderExecutionManager.State.FAILED && continuousModeEnabled) {
                         scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
                     }
@@ -488,6 +494,7 @@ class MainActivity : Activity() {
                 candidateStableFrameCount = 0
                 panelAbsentFrameCount = 0
                 lastContinuousFrameModifiedAt = 0L
+                lastCompletedIdentityScanAt = 0L
                 ScreenCaptureService.setAutomationActive(true)
                 executionStatusText.text =
                     "MODE BERKELANJUTAN AKTIF. Pindah ke game; sistem mulai memantau pelanggan."
@@ -538,12 +545,12 @@ class MainActivity : Activity() {
             isVerificationOcrRunning ||
             continuousScanInFlight
         ) {
-            scheduleContinuousMonitor(250L)
+            scheduleContinuousMonitor(150L)
             return
         }
 
         if (state == OrderExecutionManager.State.PAUSED && (!autoPausedAwaitingPanel || userPaused)) {
-            scheduleContinuousMonitor(350L)
+            scheduleContinuousMonitor(220L)
             return
         }
 
@@ -555,19 +562,268 @@ class MainActivity : Activity() {
 
         val modifiedAt = imageFile.lastModified()
         if (modifiedAt <= lastContinuousFrameModifiedAt) {
-            scheduleContinuousMonitor(250L)
+            scheduleContinuousMonitor(FRAME_POLL_INTERVAL_MS)
             return
         }
         lastContinuousFrameModifiedAt = modifiedAt
 
-        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
-        if (bitmap == null) {
+        val fullBitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+        if (fullBitmap == null) {
             scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
             return
         }
 
+        val imageWidth = fullBitmap.width
+        val imageHeight = fullBitmap.height
+        val panelRect = verificationRegion?.let { Rect(it) }?.apply {
+            intersect(0, 0, imageWidth, imageHeight)
+        }
+
+        val panelBitmap = try {
+            if (
+                panelRect != null &&
+                panelRect.width() > 0 &&
+                panelRect.height() > 0 &&
+                (panelRect.width() < imageWidth || panelRect.height() < imageHeight)
+            ) {
+                Bitmap.createBitmap(
+                    fullBitmap,
+                    panelRect.left,
+                    panelRect.top,
+                    panelRect.width(),
+                    panelRect.height()
+                )
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+
+        val scanBitmap = panelBitmap ?: fullBitmap
+        val usingPanelCrop = panelBitmap != null
         continuousScanInFlight = true
         isOcrRunning = true
+
+        val recognizer = textRecognizer
+            ?: OrderTextRecognizer().also { textRecognizer = it }
+
+        try {
+            recognizer.recognize(
+                bitmap = scanBitmap,
+                onSuccess = { result ->
+                    if (usingPanelCrop && !scanBitmap.isRecycled) {
+                        scanBitmap.recycle()
+                    }
+                    val parsed = OrderParser.parse(result)
+
+                    runOnUiThread {
+                        if (!continuousModeEnabled || isFinishing || isDestroyed) {
+                            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                            continuousScanInFlight = false
+                            isOcrRunning = false
+                            return@runOnUiThread
+                        }
+
+                        if (usingPanelCrop) {
+                            if (!parsed.headerFound || parsed.items.isEmpty()) {
+                                // The cached panel position may be stale after a
+                                // layout/orientation change. Recheck the full frame
+                                // every third miss instead of OCR-scanning the
+                                // entire screen on every idle monitoring cycle.
+                                if ((panelAbsentFrameCount + 1) % 3 == 0) {
+                                    runContinuousFullScreenScan(fullBitmap, modifiedAt)
+                                } else {
+                                    continuousScanInFlight = false
+                                    isOcrRunning = false
+                                    handleContinuousScanResult(
+                                        result = result,
+                                        parsed = parsed,
+                                        imageWidth = imageWidth,
+                                        imageHeight = imageHeight,
+                                        captureModifiedAt = modifiedAt
+                                    )
+                                    if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                                }
+                            } else {
+                                handleContinuousPanelScanResult(
+                                    parsed = parsed,
+                                    fullBitmap = fullBitmap,
+                                    captureModifiedAt = modifiedAt
+                                )
+                            }
+                        } else {
+                            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                            continuousScanInFlight = false
+                            isOcrRunning = false
+                            updateVerificationRegion(result, imageWidth, imageHeight)
+                            handleContinuousScanResult(
+                                result = result,
+                                parsed = parsed,
+                                imageWidth = imageWidth,
+                                imageHeight = imageHeight,
+                                captureModifiedAt = modifiedAt
+                            )
+                        }
+                    }
+                },
+                onFailure = { exception ->
+                    if (usingPanelCrop && !scanBitmap.isRecycled) {
+                        scanBitmap.recycle()
+                    }
+                    runOnUiThread {
+                        if (usingPanelCrop && continuousModeEnabled) {
+                            runContinuousFullScreenScan(fullBitmap, modifiedAt)
+                        } else {
+                            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                            continuousScanInFlight = false
+                            isOcrRunning = false
+                            if (continuousModeEnabled) {
+                                executionStatusText.text =
+                                    "Pemantauan pelanggan: OCR belum berhasil (${exception.message ?: "kesalahan tidak diketahui"}). Mencoba frame berikutnya."
+                                scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                            }
+                        }
+                    }
+                }
+            )
+        } catch (exception: Exception) {
+            if (usingPanelCrop && !scanBitmap.isRecycled) {
+                scanBitmap.recycle()
+            }
+            runOnUiThread {
+                if (usingPanelCrop && continuousModeEnabled) {
+                    runContinuousFullScreenScan(fullBitmap, modifiedAt)
+                } else {
+                    if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                    continuousScanInFlight = false
+                    isOcrRunning = false
+                    executionStatusText.text =
+                        "Pemantauan pelanggan mengalami kesalahan: ${exception.message ?: "tidak diketahui"}."
+                    scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                }
+            }
+        }
+    }
+
+    /**
+     * Panel pesanan dipindai lebih dahulu. OCR seluruh layar hanya dipanggil
+     * ketika panel menunjukkan pesanan baru atau posisi panel perlu dicari ulang.
+     */
+    private fun handleContinuousPanelScanResult(
+        parsed: OrderParseResult,
+        fullBitmap: Bitmap,
+        captureModifiedAt: Long
+    ) {
+        if (!parsed.headerFound || parsed.items.isEmpty()) {
+            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+            continuousScanInFlight = false
+            isOcrRunning = false
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        val hadStablePanelGap = panelAbsentFrameCount >= CONTINUOUS_STABLE_FRAME_COUNT
+        panelAbsentFrameCount = 0
+
+        val signature = createCustomerSignature(parsed)
+        if (signature.isBlank()) {
+            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+            continuousScanInFlight = false
+            isOcrRunning = false
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        if (candidateCustomerSignature == signature) {
+            candidateStableFrameCount++
+        } else {
+            candidateCustomerSignature = signature
+            candidateStableFrameCount = 1
+        }
+
+        if (candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT) {
+            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+            continuousScanInFlight = false
+            isOcrRunning = false
+            executionStatusText.text =
+                "Panel pesanan terdeteksi. Memastikan daftar stabil (${candidateStableFrameCount}/${CONTINUOUS_STABLE_FRAME_COUNT})."
+            scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
+            return
+        }
+
+        val managerState = executionManager?.state
+
+        if (
+            managerState == OrderExecutionManager.State.PAUSED &&
+            autoPausedAwaitingPanel &&
+            !userPaused
+        ) {
+            if (signature == activeCustomerSignature) {
+                if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                continuousScanInFlight = false
+                isOcrRunning = false
+                autoPausedAwaitingPanel = false
+                executionStatusText.text =
+                    "Panel pelanggan yang sama kembali terdeteksi. Melanjutkan verifikasi sebelumnya."
+                executionManager?.resume()
+                scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
+                return
+            }
+
+            executionManager?.stop()
+            pendingVerification = null
+            autoPausedAwaitingPanel = false
+            activeCustomerSignature = null
+            activeCustomerLabel = null
+            executionStatusText.text =
+                "Pesanan berbeda terdeteksi setelah interupsi. Menyiapkan pembacaan lengkap untuk antrean baru."
+        } else if (
+            managerState == OrderExecutionManager.State.PAUSED ||
+            managerState == OrderExecutionManager.State.RUNNING ||
+            managerState == OrderExecutionManager.State.WAITING_VERIFICATION
+        ) {
+            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+            continuousScanInFlight = false
+            isOcrRunning = false
+            scheduleContinuousMonitor(220L)
+            return
+        }
+
+        val sameCompletedPanel =
+            managerState == OrderExecutionManager.State.COMPLETED &&
+                signature == activeCustomerSignature &&
+                !hadStablePanelGap
+
+        val alreadyServedPanel =
+            signature == lastServedCustomerSignature &&
+                !hadStablePanelGap
+
+        if (sameCompletedPanel || alreadyServedPanel) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastCompletedIdentityScanAt >= COMPLETED_IDENTITY_SCAN_INTERVAL_MS) {
+                lastCompletedIdentityScanAt = now
+                runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+            } else {
+                if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                continuousScanInFlight = false
+                isOcrRunning = false
+                executionStatusText.text =
+                    "Pesanan saat ini sudah selesai. Memantau panel untuk pelanggan berikutnya."
+                scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            }
+            return
+        }
+
+        // New/changed panel: use the same captured frame for one full-screen OCR
+        // so SmartItemDetector can locate the requested products on the shelves.
+        runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+    }
+
+    private fun runContinuousFullScreenScan(
+        bitmap: Bitmap,
+        captureModifiedAt: Long
+    ) {
         val imageWidth = bitmap.width
         val imageHeight = bitmap.height
         val recognizer = textRecognizer
@@ -580,33 +836,26 @@ class MainActivity : Activity() {
                     if (!bitmap.isRecycled) bitmap.recycle()
                     continuousScanInFlight = false
                     isOcrRunning = false
-                    if (!continuousModeEnabled) return@recognize
+                    if (!continuousModeEnabled || isFinishing || isDestroyed) return@recognize
 
                     val parsed = OrderParser.parse(result)
-                    runOnUiThread {
-                        if (!continuousModeEnabled || isFinishing || isDestroyed) {
-                            return@runOnUiThread
-                        }
-                        updateVerificationRegion(result, imageWidth, imageHeight)
-                        handleContinuousScanResult(
-                            result = result,
-                            parsed = parsed,
-                            imageWidth = imageWidth,
-                            imageHeight = imageHeight,
-                            captureModifiedAt = modifiedAt
-                        )
-                    }
+                    updateVerificationRegion(result, imageWidth, imageHeight)
+                    handleContinuousScanResult(
+                        result = result,
+                        parsed = parsed,
+                        imageWidth = imageWidth,
+                        imageHeight = imageHeight,
+                        captureModifiedAt = captureModifiedAt
+                    )
                 },
                 onFailure = { exception ->
                     if (!bitmap.isRecycled) bitmap.recycle()
                     continuousScanInFlight = false
                     isOcrRunning = false
-                    runOnUiThread {
-                        if (continuousModeEnabled) {
-                            executionStatusText.text =
-                                "Pemantauan pelanggan: OCR belum berhasil (${exception.message ?: "kesalahan tidak diketahui"}). Mencoba frame berikutnya."
-                            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
-                        }
+                    if (continuousModeEnabled) {
+                        executionStatusText.text =
+                            "Pembacaan lengkap panel/rak gagal (${exception.message ?: "kesalahan tidak diketahui"}). Mencoba frame berikutnya."
+                        scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
                     }
                 }
             )
@@ -614,11 +863,9 @@ class MainActivity : Activity() {
             if (!bitmap.isRecycled) bitmap.recycle()
             continuousScanInFlight = false
             isOcrRunning = false
-            runOnUiThread {
-                executionStatusText.text =
-                    "Pemantauan pelanggan mengalami kesalahan: ${exception.message ?: "tidak diketahui"}."
-                scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
-            }
+            executionStatusText.text =
+                "Pembacaan lengkap panel/rak gagal: ${exception.message ?: "tidak diketahui"}."
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
         }
     }
 
@@ -673,7 +920,7 @@ class MainActivity : Activity() {
         if (candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT) {
             executionStatusText.text =
                 "Panel pelanggan terdeteksi. Memastikan pesanan stabil (${candidateStableFrameCount}/${CONTINUOUS_STABLE_FRAME_COUNT})."
-            scheduleContinuousMonitor(250L)
+            scheduleContinuousMonitor(180L)
             return
         }
 
@@ -691,7 +938,7 @@ class MainActivity : Activity() {
                 executionStatusText.text =
                     "Panel pelanggan yang sama kembali terdeteksi. Melanjutkan verifikasi sebelumnya."
                 executionManager?.resume()
-                scheduleContinuousMonitor(300L)
+                scheduleContinuousMonitor(180L)
                 return
             }
 
@@ -710,7 +957,7 @@ class MainActivity : Activity() {
             managerState == OrderExecutionManager.State.RUNNING ||
             managerState == OrderExecutionManager.State.WAITING_VERIFICATION
         ) {
-            scheduleContinuousMonitor(350L)
+            scheduleContinuousMonitor(220L)
             return
         }
 
@@ -807,6 +1054,7 @@ class MainActivity : Activity() {
         activeCustomerSignature = signature
         activeCustomerLabel = extractCustomerLabel(result)
         lastServedCustomerSignature = null
+        lastCompletedIdentityScanAt = 0L
         autoPausedAwaitingPanel = false
         runOnUiThread {
             if (!isFinishing && !isDestroyed) {
@@ -858,6 +1106,7 @@ class MainActivity : Activity() {
         candidateStableFrameCount = 0
         panelAbsentFrameCount = 0
         lastContinuousFrameModifiedAt = 0L
+        lastCompletedIdentityScanAt = 0L
         continuousMonitorRunnable?.let { mainHandler.removeCallbacks(it) }
         continuousMonitorRunnable = null
         pendingVerification = null
@@ -1127,7 +1376,7 @@ class MainActivity : Activity() {
             } else {
                 executionStatusText.text = "Pemantauan pelanggan dilanjutkan."
                 ScreenCaptureService.setAutomationActive(true)
-                scheduleContinuousMonitor(250L)
+                scheduleContinuousMonitor(180L)
             }
         }
         pendingStartRunnable = runnable
@@ -1148,7 +1397,8 @@ class MainActivity : Activity() {
             expectedQuantity = expectedQuantity,
             requiredQuantity = requiredQuantity,
             attempts = 0,
-            lastCaptureModified = if (captureFile.exists()) captureFile.lastModified() else 0L
+            lastCaptureModified = if (captureFile.exists()) captureFile.lastModified() else 0L,
+            startedAtElapsedMs = SystemClock.elapsedRealtime()
         )
         executionStatusText.text = "Tap $itemName dikirim. Memeriksa perubahan jumlah pada panel pesanan..."
         scheduleVerificationPoll(FIRST_VERIFICATION_DELAY_MS)
@@ -1161,7 +1411,7 @@ class MainActivity : Activity() {
     private fun pollAutomaticVerification() {
         val pending = pendingVerification ?: return
         if (isVerificationOcrRunning || isOcrRunning) {
-            scheduleVerificationPoll(150L)
+            scheduleVerificationPoll(FRAME_POLL_INTERVAL_MS)
             return
         }
         if (!ScreenCaptureService.isRunning) {
@@ -1178,7 +1428,14 @@ class MainActivity : Activity() {
 
         val modified = imageFile.lastModified()
         if (modified <= pending.lastCaptureModified) {
-            retryOrFailVerification("Menunggu frame game baru.")
+            // A stale frame is not an OCR failure. Wait briefly for the next
+            // capture without consuming the limited OCR retry budget.
+            val waitingMs = SystemClock.elapsedRealtime() - pending.startedAtElapsedMs
+            if (waitingMs >= MAX_CAPTURE_WAIT_MS) {
+                retryOrFailVerification("Frame game baru tidak diterima dalam ${MAX_CAPTURE_WAIT_MS} ms.")
+            } else {
+                scheduleVerificationPoll(FRAME_POLL_INTERVAL_MS)
+            }
             return
         }
         pending.lastCaptureModified = modified
@@ -1431,13 +1688,13 @@ class MainActivity : Activity() {
         )
         executionStatusText.text =
             "$reason Menunggu panel kembali atau pelanggan baru terdeteksi."
-        scheduleContinuousMonitor(250L)
+        scheduleContinuousMonitor(180L)
     }
 
     private fun verificationRetryDelay(retryNumber: Int): Long = when (retryNumber) {
-        1 -> 250L
-        2 -> 350L
-        else -> 350L
+        1 -> 120L
+        2 -> 180L
+        else -> 180L
     }
 
     private fun retryOrFailVerification(reason: String) {
