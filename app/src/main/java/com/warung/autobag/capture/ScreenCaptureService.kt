@@ -45,7 +45,7 @@ class ScreenCaptureService : Service() {
         private const val NOTIFICATION_ID = 2001
         private const val REQUEST_STOP = 2002
         private const val IDLE_CAPTURE_INTERVAL_MS = 1000L
-        private const val AUTOMATION_CAPTURE_INTERVAL_MS = 300L
+        private const val AUTOMATION_CAPTURE_INTERVAL_MS = 180L
 
         @Volatile
         private var automationActive: Boolean = false
@@ -303,7 +303,7 @@ class ScreenCaptureService : Service() {
             FileOutputStream(temporaryFile).use { output ->
                 val compressed = cropped.compress(
                     Bitmap.CompressFormat.JPEG,
-                    85,
+                    80,
                     output
                 )
                 if (!compressed) {
