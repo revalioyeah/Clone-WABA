@@ -28,6 +28,8 @@ import android.widget.TextView
 import android.widget.Toast
 import com.warung.autobag.capture.ScreenCaptureService
 import com.warung.autobag.detection.SmartDetectionResult
+import com.warung.autobag.detection.SmartDetectedItem
+import com.warung.autobag.detection.ItemCatalog
 import com.warung.autobag.detection.SmartItemDetector
 import com.warung.autobag.gesture.GestureAccessibilityService
 import com.warung.autobag.gesture.GestureController
@@ -35,6 +37,7 @@ import com.warung.autobag.gesture.OrderExecutionManager
 import com.warung.autobag.gesture.TargetGameConfig
 import com.warung.autobag.ocr.OrderParser
 import com.warung.autobag.ocr.OrderParseResult
+import com.warung.autobag.ocr.ParsedOrderItem
 import com.warung.autobag.ocr.OrderTextRecognizer
 import com.warung.autobag.ocr.OcrResult
 import java.io.File
@@ -45,16 +48,17 @@ class MainActivity : Activity() {
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REFERENCE_IMAGE_WIDTH = 2304f
         private const val MAX_VERIFICATION_ATTEMPTS = 3
-        private const val MAX_CAPTURE_WAIT_MS = 1_800L
-        private const val FRAME_POLL_INTERVAL_MS = 60L
-        private const val COMPLETED_IDENTITY_SCAN_INTERVAL_MS = 1_200L
-        private const val FIRST_VERIFICATION_DELAY_MS = 120L
+        private const val MAX_CAPTURE_WAIT_MS = 900L
+        private const val FRAME_POLL_INTERVAL_MS = 25L
+        private const val COMPLETED_IDENTITY_SCAN_INTERVAL_MS = 500L
+        private const val FIRST_VERIFICATION_DELAY_MS = 70L
         private const val GAME_SWITCH_DELAY_MS = 1_500L
-        private const val CONTINUOUS_MONITOR_INTERVAL_MS = 180L
-        private const val CONTINUOUS_IDLE_RETRY_MS = 300L
-        private const val CONTINUOUS_STABLE_FRAME_COUNT = 2
-        private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 6
-        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 180L
+        private const val CONTINUOUS_MONITOR_INTERVAL_MS = 90L
+        private const val CONTINUOUS_IDLE_RETRY_MS = 140L
+        private const val CONTINUOUS_STABLE_FRAME_COUNT = 1
+        private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 4
+        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 100L
+        private const val PRODUCT_LOCATION_CACHE_TTL_MS = 10 * 60 * 1000L
     }
 
     private lateinit var statusText: TextView
@@ -94,6 +98,13 @@ class MainActivity : Activity() {
     private var activeCustomerLabel: String? = null
     private var lastServedCustomerSignature: String? = null
     private var autoPausedAwaitingPanel = false
+
+    // Shelf locations are stable across customers while the game layout and
+    // screenshot dimensions remain unchanged. Seeded by the initial full OCR.
+    private val cachedProductLocations = mutableMapOf<String, SmartDetectedItem>()
+    private var cachedLocationImageWidth = 0
+    private var cachedLocationImageHeight = 0
+    private var cachedLocationUpdatedAt = 0L
     private var userPaused = false
 
     private data class PendingVerification(
@@ -229,6 +240,7 @@ class MainActivity : Activity() {
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
                 pendingStartRunnable = null
                 executionManager?.pause()
+                GestureAccessibilityService.instance?.cancelPendingTapBatch()
                 executionStatusText.text = "PAUSE diminta. Mode otomatis menunggu perintah LANJUTKAN."
             }
         }
@@ -245,6 +257,7 @@ class MainActivity : Activity() {
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
                 pendingStartRunnable = null
                 executionManager?.stop()
+                GestureAccessibilityService.instance?.cancelPendingTapBatch()
                 executionStatusText.text = "Mode otomatis dihentikan. Tidak ada pelanggan berikutnya yang akan diproses."
             }
         }
@@ -367,15 +380,17 @@ class MainActivity : Activity() {
 
     private fun createExecutionManager() {
         executionManager = OrderExecutionManager(
-            tapDispatcher = OrderExecutionManager.TapDispatcher { source, onComplete ->
+            tapDispatcher = OrderExecutionManager.TapDispatcher { source, tapCount, onComplete ->
                 if (latestImageWidth <= 0 || latestImageHeight <= 0) {
-                    onComplete(false, "Ukuran screenshot terakhir belum tersedia.")
+                    onComplete(false, "Ukuran screenshot terakhir belum tersedia.", 0)
                 } else {
-                    GestureController.executeTapFromImage(
+                    GestureController.executeTapBatchFromImage(
                         sourceImagePoint = GestureController.ScreenPoint(source.x, source.y),
                         imageWidth = latestImageWidth,
                         imageHeight = latestImageHeight,
+                        tapCount = tapCount,
                         durationMs = TargetGameConfig.TAP_DURATION_MS,
+                        intervalMs = TargetGameConfig.TAP_INTERVAL_MS,
                         onComplete = onComplete
                     )
                 }
@@ -391,10 +406,10 @@ class MainActivity : Activity() {
                         lastServedCustomerSignature = activeCustomerSignature
                         autoPausedAwaitingPanel = false
                         if (continuousModeEnabled) {
-                            scheduleContinuousMonitor(180L)
+                            scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
                         }
                     } else if (snapshot.state == OrderExecutionManager.State.PAUSED && continuousModeEnabled) {
-                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(180L)
+                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
                     } else if (snapshot.state == OrderExecutionManager.State.FAILED && continuousModeEnabled) {
                         scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
                     }
@@ -460,7 +475,7 @@ class MainActivity : Activity() {
             return
         }
         if (latestDetection == null || latestImageWidth <= 0 || latestImageHeight <= 0) {
-            executionStatusText.text = "Lakukan BACA PESANAN & DETEKSI LOKASI minimal sekali untuk memeriksa kalibrasi awal."
+            executionStatusText.text = "Lakukan BACA PESANAN & DETEKSI LOKASI minimal sekali untuk mengisi cache lokasi produk sebelum mode berkelanjutan."
             return
         }
         if (!ScreenCaptureService.isRunning) {
@@ -479,7 +494,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Mulai mode otomatis berkelanjutan")
             .setMessage(
-                "Aplikasi akan memantau panel PESANAN, membaca pelanggan baru, mendeteksi lokasi barang, lalu menyelesaikan pesanan satu per satu. Setelah menekan MULAI, pindah ke game dalam 1,5 detik. Mode tetap aktif sampai kamu menekan STOP.\n\nPastikan kalibrasi barang dan kantong sudah diperiksa."
+                "Aplikasi akan memantau panel PESANAN, membaca pelanggan baru, mendeteksi lokasi barang, lalu menyelesaikan pesanan satu per satu. Setelah menekan MULAI, pindah ke game dalam 1,5 detik. Mode tetap aktif sampai kamu menekan STOP.\n\nPastikan BACA PESANAN & DETEKSI LOKASI sudah dijalankan agar cache lokasi seluruh rak tersedia. Periksa titik hijau pada preview; titik kantong tidak diperlukan."
             )
             .setNegativeButton("BATAL", null)
             .setPositiveButton("MULAI") { _, _ ->
@@ -550,7 +565,7 @@ class MainActivity : Activity() {
         }
 
         if (state == OrderExecutionManager.State.PAUSED && (!autoPausedAwaitingPanel || userPaused)) {
-            scheduleContinuousMonitor(220L)
+            scheduleContinuousMonitor(120L)
             return
         }
 
@@ -647,6 +662,7 @@ class MainActivity : Activity() {
                                 }
                             } else {
                                 handleContinuousPanelScanResult(
+                                    panelOcrResult = result,
                                     parsed = parsed,
                                     fullBitmap = fullBitmap,
                                     captureModifiedAt = modifiedAt
@@ -711,6 +727,7 @@ class MainActivity : Activity() {
      * ketika panel menunjukkan pesanan baru atau posisi panel perlu dicari ulang.
      */
     private fun handleContinuousPanelScanResult(
+        panelOcrResult: OcrResult,
         parsed: OrderParseResult,
         fullBitmap: Bitmap,
         captureModifiedAt: Long
@@ -772,6 +789,7 @@ class MainActivity : Activity() {
             }
 
             executionManager?.stop()
+            GestureAccessibilityService.instance?.cancelPendingTapBatch()
             pendingVerification = null
             autoPausedAwaitingPanel = false
             activeCustomerSignature = null
@@ -786,7 +804,7 @@ class MainActivity : Activity() {
             if (!fullBitmap.isRecycled) fullBitmap.recycle()
             continuousScanInFlight = false
             isOcrRunning = false
-            scheduleContinuousMonitor(220L)
+            scheduleContinuousMonitor(120L)
             return
         }
 
@@ -815,8 +833,35 @@ class MainActivity : Activity() {
             return
         }
 
-        // New/changed panel: use the same captured frame for one full-screen OCR
-        // so SmartItemDetector can locate the requested products on the shelves.
+        // Fast path: use shelf coordinates learned during the initial full-screen
+        // scan. The shelf layout is static for this game screen, so a new customer
+        // usually needs only one small OCR pass over the order panel.
+        val cachedDetection = buildDetectionFromLocationCache(
+            parsed = parsed,
+            imageWidth = fullBitmap.width,
+            imageHeight = fullBitmap.height
+        )
+        if (cachedDetection != null) {
+            val imageWidth = fullBitmap.width
+            val imageHeight = fullBitmap.height
+            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+            continuousScanInFlight = false
+            isOcrRunning = false
+            startContinuousCustomerOrder(
+                result = panelOcrResult,
+                parsed = parsed,
+                signature = signature,
+                imageWidth = imageWidth,
+                imageHeight = imageHeight,
+                captureModifiedAt = captureModifiedAt,
+                precomputedDetection = cachedDetection,
+                useCustomerLabelFromResult = false
+            )
+            return
+        }
+
+        // Cache miss (new product, stale cache, or changed layout): do one
+        // full-screen OCR and refresh the cache for subsequent customers.
         runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
     }
 
@@ -840,6 +885,7 @@ class MainActivity : Activity() {
 
                     val parsed = OrderParser.parse(result)
                     updateVerificationRegion(result, imageWidth, imageHeight)
+                    rememberProductLocationCache(result, imageWidth, imageHeight)
                     handleContinuousScanResult(
                         result = result,
                         parsed = parsed,
@@ -920,7 +966,7 @@ class MainActivity : Activity() {
         if (candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT) {
             executionStatusText.text =
                 "Panel pelanggan terdeteksi. Memastikan pesanan stabil (${candidateStableFrameCount}/${CONTINUOUS_STABLE_FRAME_COUNT})."
-            scheduleContinuousMonitor(180L)
+            scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
             return
         }
 
@@ -938,7 +984,7 @@ class MainActivity : Activity() {
                 executionStatusText.text =
                     "Panel pelanggan yang sama kembali terdeteksi. Melanjutkan verifikasi sebelumnya."
                 executionManager?.resume()
-                scheduleContinuousMonitor(180L)
+                scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
                 return
             }
 
@@ -946,6 +992,7 @@ class MainActivity : Activity() {
             // customer has left. Discard its stale checkpoint before starting
             // the new customer's queue.
             executionManager?.stop()
+            GestureAccessibilityService.instance?.cancelPendingTapBatch()
             pendingVerification = null
             autoPausedAwaitingPanel = false
             activeCustomerSignature = null
@@ -957,7 +1004,7 @@ class MainActivity : Activity() {
             managerState == OrderExecutionManager.State.RUNNING ||
             managerState == OrderExecutionManager.State.WAITING_VERIFICATION
         ) {
-            scheduleContinuousMonitor(220L)
+            scheduleContinuousMonitor(120L)
             return
         }
 
@@ -998,7 +1045,9 @@ class MainActivity : Activity() {
         signature: String,
         imageWidth: Int,
         imageHeight: Int,
-        captureModifiedAt: Long
+        captureModifiedAt: Long,
+        precomputedDetection: SmartDetectionResult? = null,
+        useCustomerLabelFromResult: Boolean = true
     ) {
         val pendingOrders = parsed.items.filter { order ->
             val current = order.currentQuantity
@@ -1008,7 +1057,9 @@ class MainActivity : Activity() {
 
         if (pendingOrders.isEmpty()) {
             activeCustomerSignature = signature
-            activeCustomerLabel = extractCustomerLabel(result)
+            if (useCustomerLabelFromResult) {
+                activeCustomerLabel = extractCustomerLabel(result)
+            }
             lastServedCustomerSignature = signature
             latestParsedOrder = parsed
             latestCaptureModifiedAtOcr = captureModifiedAt
@@ -1025,7 +1076,7 @@ class MainActivity : Activity() {
             return
         }
 
-        val detection = SmartItemDetector.detect(
+        val detection = precomputedDetection ?: SmartItemDetector.detect(
             ocrResult = result,
             orders = parsed.items,
             imageWidth = imageWidth,
@@ -1040,7 +1091,9 @@ class MainActivity : Activity() {
         }
         if (tasks.isEmpty()) {
             activeCustomerSignature = signature
-            activeCustomerLabel = extractCustomerLabel(result)
+            if (useCustomerLabelFromResult) {
+                activeCustomerLabel = extractCustomerLabel(result)
+            }
             lastServedCustomerSignature = signature
             scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
             return
@@ -1052,7 +1105,9 @@ class MainActivity : Activity() {
         latestImageHeight = imageHeight
         latestCaptureModifiedAtOcr = captureModifiedAt
         activeCustomerSignature = signature
-        activeCustomerLabel = extractCustomerLabel(result)
+        if (useCustomerLabelFromResult) {
+            activeCustomerLabel = extractCustomerLabel(result)
+        }
         lastServedCustomerSignature = null
         lastCompletedIdentityScanAt = 0L
         autoPausedAwaitingPanel = false
@@ -1064,12 +1119,113 @@ class MainActivity : Activity() {
                     imageWidth = imageWidth,
                     imageHeight = imageHeight
                 )
-                ocrResultText.text = buildRawOcrOutput(result)
+                ocrResultText.text = if (useCustomerLabelFromResult) buildRawOcrOutput(result) else "Pesanan dibaca dari panel; lokasi rak menggunakan cache hasil pemindaian awal."
                 executionStatusText.text =
                     "Pelanggan baru terdeteksi: ${tasks.size} jenis pesanan. Memulai eksekusi otomatis."
                 executionManager?.start(tasks)
             }
         }
+    }
+
+    /**
+     * Learn every visible shelf label once from a full-screen OCR result.
+     * This runs outside the customer timer during the initial manual scan,
+     * then lets later customers reuse calibrated product points.
+     */
+    private fun rememberProductLocationCache(
+        ocrResult: OcrResult,
+        imageWidth: Int,
+        imageHeight: Int,
+        force: Boolean = false
+    ) {
+        if (imageWidth <= 0 || imageHeight <= 0) return
+
+        val cacheAge = SystemClock.elapsedRealtime() - cachedLocationUpdatedAt
+        val sameLayout =
+            cachedLocationImageWidth == imageWidth &&
+                cachedLocationImageHeight == imageHeight
+        if (
+            !force &&
+            sameLayout &&
+            cachedProductLocations.isNotEmpty() &&
+            cacheAge in 0L..PRODUCT_LOCATION_CACHE_TTL_MS
+        ) {
+            return
+        }
+
+        if (force || !sameLayout) {
+            cachedProductLocations.clear()
+        }
+
+        val catalogOrders = ItemCatalog.entries.map { entry ->
+            ParsedOrderItem(
+                name = entry.name,
+                currentQuantity = 0,
+                requiredQuantity = 1,
+                rawText = entry.name
+            )
+        }
+
+        val allLocations = SmartItemDetector.detect(
+            ocrResult = ocrResult,
+            orders = catalogOrders,
+            imageWidth = imageWidth,
+            imageHeight = imageHeight
+        )
+
+        allLocations.detections.forEach { detected ->
+            cachedProductLocations[normalizeItemName(detected.itemName)] = detected
+        }
+        cachedLocationImageWidth = imageWidth
+        cachedLocationImageHeight = imageHeight
+        cachedLocationUpdatedAt = SystemClock.elapsedRealtime()
+    }
+
+    /**
+     * Rebuild detection data for a new order using cached shelf points.
+     * Returns null if even one pending product is missing from the cache.
+     */
+    private fun buildDetectionFromLocationCache(
+        parsed: OrderParseResult,
+        imageWidth: Int,
+        imageHeight: Int
+    ): SmartDetectionResult? {
+        val cacheAge = SystemClock.elapsedRealtime() - cachedLocationUpdatedAt
+        if (
+            cachedProductLocations.isEmpty() ||
+            cachedLocationImageWidth != imageWidth ||
+            cachedLocationImageHeight != imageHeight ||
+            cacheAge < 0L ||
+            cacheAge > PRODUCT_LOCATION_CACHE_TTL_MS
+        ) {
+            return null
+        }
+
+        val pendingOrders = parsed.items.filter { order ->
+            val current = order.currentQuantity
+            val required = order.requiredQuantity
+            current != null && required != null && current < required
+        }
+
+        val detections = mutableListOf<SmartDetectedItem>()
+        for (order in pendingOrders) {
+            val cached = cachedProductLocations[normalizeItemName(order.name)]
+                ?: return null
+            detections += cached.copy(
+                itemName = order.name,
+                requestedQuantity = order.requiredQuantity,
+                currentQuantity = order.currentQuantity,
+                remainingQuantity = (
+                    order.requiredQuantity!! - order.currentQuantity!!
+                ).coerceAtLeast(0)
+            )
+        }
+
+        return SmartDetectionResult(
+            detections = detections,
+            notFoundItems = emptyList(),
+            message = "Lokasi ${detections.size} jenis barang diambil dari cache rak."
+        )
     }
 
     private fun createCustomerSignature(parsed: OrderParseResult): String =
@@ -1284,6 +1440,7 @@ class MainActivity : Activity() {
                         imageWidth = imageWidth,
                         imageHeight = imageHeight
                     )
+                    rememberProductLocationCache(result, imageWidth, imageHeight, force = true)
                     latestParsedOrder = parsed
                     latestDetection = detection
                     latestImageWidth = imageWidth
@@ -1376,7 +1533,7 @@ class MainActivity : Activity() {
             } else {
                 executionStatusText.text = "Pemantauan pelanggan dilanjutkan."
                 ScreenCaptureService.setAutomationActive(true)
-                scheduleContinuousMonitor(180L)
+                scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
             }
         }
         pendingStartRunnable = runnable
@@ -1652,6 +1809,19 @@ class MainActivity : Activity() {
             pending.attempts++
             executionStatusText.text = "Jumlah ${pending.itemName} belum berubah pada OCR (${pending.attempts + 1}/$MAX_VERIFICATION_ATTEMPTS). Memeriksa frame berikutnya."
             scheduleVerificationPoll(verificationRetryDelay(pending.attempts))
+        } else if (
+            item.currentQuantity != null &&
+            item.currentQuantity > pending.previousQuantity &&
+            item.currentQuantity < pending.expectedQuantity &&
+            item.requiredQuantity == pending.requiredQuantity &&
+            pending.attempts < MAX_VERIFICATION_ATTEMPTS - 1
+        ) {
+            // A partial batch can be a genuinely missed tap or an OCR frame
+            // captured between the two game updates. Confirm it on a fresh frame.
+            pending.attempts++
+            executionStatusText.text =
+                "Jumlah ${pending.itemName} baru terbaca sebagian (${item.currentQuantity}/${pending.expectedQuantity}). Memastikan pada frame berikutnya."
+            scheduleVerificationPoll(verificationRetryDelay(pending.attempts))
         } else {
             pendingVerification = null
             executionManager?.confirmQuantity(
@@ -1688,13 +1858,13 @@ class MainActivity : Activity() {
         )
         executionStatusText.text =
             "$reason Menunggu panel kembali atau pelanggan baru terdeteksi."
-        scheduleContinuousMonitor(180L)
+        scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
     }
 
     private fun verificationRetryDelay(retryNumber: Int): Long = when (retryNumber) {
-        1 -> 120L
-        2 -> 180L
-        else -> 180L
+        1 -> 80L
+        2 -> 120L
+        else -> 120L
     }
 
     private fun retryOrFailVerification(reason: String) {
@@ -1810,6 +1980,7 @@ class MainActivity : Activity() {
     private fun stopScreenCapture() {
         stopContinuousMode()
         executionManager?.stop()
+        GestureAccessibilityService.instance?.cancelPendingTapBatch()
         val serviceIntent = Intent(
             this,
             ScreenCaptureService::class.java
@@ -2028,6 +2199,7 @@ class MainActivity : Activity() {
                         imageWidth = imageWidth,
                         imageHeight = imageHeight
                     )
+                    rememberProductLocationCache(result, imageWidth, imageHeight, force = true)
 
                     latestParsedOrder = parsed
                     latestDetection = detection
@@ -2388,6 +2560,7 @@ class MainActivity : Activity() {
         ScreenCaptureService.setAutomationActive(false)
         verificationRegion = null
         executionManager?.stop()
+        GestureAccessibilityService.instance?.cancelPendingTapBatch()
         executionManager = null
         textRecognizer?.close()
         textRecognizer = null
