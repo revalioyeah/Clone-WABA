@@ -177,7 +177,7 @@ object OrderParser {
         // Posisi dihitung dari Text.Element apabila tersedia.
         val rawItems = mutableListOf<Pair<String, Box>>()
         val rawQuantities =
-            mutableListOf<Triple<Int, Int, Pair<Box, String>>>()
+            mutableListOf<Triple<Int?, Int, Pair<Box, String>>>()
 
         for (line in boardLines) {
 
