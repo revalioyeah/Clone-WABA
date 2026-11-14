@@ -1,27 +1,37 @@
+
 package com.warung.autobag
 
 import android.app.Activity
-import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.media.projection.MediaProjectionManager
 import android.os.Bundle
-import android.provider.Settings
+import android.view.Gravity
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import com.warung.autobag.automation.AutoBagAccessibilityService
+import com.warung.autobag.capture.ScreenCaptureService
+import java.io.File
 
 class MainActivity : Activity() {
 
-    private lateinit var accessibilityStatus: TextView
+    companion object {
+        private const val REQUEST_SCREEN_CAPTURE = 3101
+    }
+
+    private lateinit var statusText: TextView
+    private lateinit var previewImage: ImageView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(28), dp(22), dp(24))
+            setPadding(dp(22), dp(26), dp(22), dp(24))
             setBackgroundColor(Color.rgb(246, 248, 246))
         }
 
@@ -30,84 +40,236 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = getString(com.warung.autobag.R.string.app_name)
-            textSize = 26f
+            text = "Warung Auto Bag Assistant"
+            textSize = 25f
             setTextColor(Color.rgb(25, 65, 38))
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
 
         val subtitle = TextView(this).apply {
-            text = "Asisten otomatis untuk membantu proses pengemasan pesanan di Warung Life Simulator."
+            text = "Screen Capture Engine\n\nAmbil gambar layar game untuk diproses oleh sistem OCR."
             textSize = 15f
-            setTextColor(Color.rgb(70, 78, 72))
+            setTextColor(Color.DKGRAY)
         }
 
-        val stageHeading = TextView(this).apply {
-            text = "STATUS PENGEMBANGAN"
-            textSize = 13f
+        val heading = TextView(this).apply {
+            text = "SCREEN CAPTURE CONTROL"
+            textSize = 14f
             setTextColor(Color.rgb(25, 65, 38))
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
 
-        val stageInfo = TextView(this).apply {
-            text = "Tahap 1 — Fondasi aplikasi berhasil dimuat. Fitur pembacaan pesanan dan drag-and-drop belum diaktifkan."
+        statusText = TextView(this).apply {
+            text = "Status: Screen Capture belum aktif."
             textSize = 14f
-            setTextColor(Color.rgb(55, 65, 58))
+            setTextColor(Color.DKGRAY)
         }
 
-        accessibilityStatus = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.rgb(55, 65, 58))
-        }
-
-        val accessibilityButton = Button(this).apply {
-            text = "BUKA PENGATURAN ACCESSIBILITY"
+        val startButton = Button(this).apply {
+            text = "MULAI SCREEN CAPTURE"
             setOnClickListener {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                requestScreenCapture()
             }
         }
 
-        val safetyNote = TextView(this).apply {
-            text = "Catatan keamanan: layanan Accessibility pada tahap ini hanya disiapkan sebagai fondasi. Aplikasi belum membaca layar, belum mengambil alih sentuhan, dan belum melakukan tindakan otomatis pada game."
-            textSize = 13f
-            setTextColor(Color.rgb(90, 90, 90))
+        val stopButton = Button(this).apply {
+            text = "HENTIKAN SCREEN CAPTURE"
+            setOnClickListener {
+                stopScreenCapture()
+            }
         }
 
-        page.addView(title, marginParams(bottom = 8))
-        page.addView(subtitle, marginParams(bottom = 26))
-        page.addView(stageHeading, marginParams(bottom = 8))
-        page.addView(stageInfo, marginParams(bottom = 18))
-        page.addView(accessibilityStatus, marginParams(bottom = 12))
-        page.addView(accessibilityButton, marginParams(bottom = 18))
-        page.addView(safetyNote, marginParams())
+        val previewButton = Button(this).apply {
+            text = "LIHAT HASIL TANGKAPAN"
+            setOnClickListener {
+                showLatestCapture()
+            }
+        }
+
+        val previewHeading = TextView(this).apply {
+            text = "PREVIEW HASIL TANGKAPAN"
+            textSize = 14f
+            setTextColor(Color.rgb(25, 65, 38))
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+
+        previewImage = ImageView(this).apply {
+            setBackgroundColor(Color.rgb(225, 230, 225))
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            adjustViewBounds = true
+            contentDescription = "Hasil tangkapan layar"
+        }
+
+        val instruction = TextView(this).apply {
+            text = """
+                PETUNJUK PENGGUNAAN
+
+                1. Tekan MULAI SCREEN CAPTURE.
+                2. Setujui permintaan perekaman layar Android.
+                3. Pilih seluruh layar jika tersedia.
+                4. Pindah ke Warung Life Simulator.
+                5. Tunggu beberapa detik.
+                6. Hentikan capture melalui notifikasi Android.
+                7. Kembali ke aplikasi dan lihat hasil tangkapan.
+
+                Gambar terakhir disimpan secara lokal di penyimpanan internal aplikasi.
+            """.trimIndent()
+
+            textSize = 13f
+            setTextColor(Color.DKGRAY)
+        }
+
+        page.addView(title, marginParams(8))
+        page.addView(subtitle, marginParams(24))
+        page.addView(heading, marginParams(12))
+        page.addView(statusText, marginParams(12))
+        page.addView(startButton, marginParams(8))
+        page.addView(stopButton, marginParams(8))
+        page.addView(previewButton, marginParams(22))
+        page.addView(previewHeading, marginParams(10))
+
+        page.addView(
+            previewImage,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(350)
+            ).apply {
+                bottomMargin = dp(20)
+            }
+        )
+
+        page.addView(instruction, marginParams())
 
         setContentView(scrollView)
     }
 
-    override fun onResume() {
-        super.onResume()
-        if (::accessibilityStatus.isInitialized) {
-            accessibilityStatus.text = if (isAccessibilityServiceEnabled()) {
-                "Accessibility Service: AKTIF"
-            } else {
-                "Accessibility Service: BELUM DIAKTIFKAN"
+    private fun requestScreenCapture() {
+
+        val manager = getSystemService(
+            Context.MEDIA_PROJECTION_SERVICE
+        ) as MediaProjectionManager
+
+        val captureIntent =
+            manager.createScreenCaptureIntent()
+
+        startActivityForResult(
+            captureIntent,
+            REQUEST_SCREEN_CAPTURE
+        )
+    }
+
+    @Deprecated("Using the standard MediaProjection consent result")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?
+    ) {
+        super.onActivityResult(
+            requestCode,
+            resultCode,
+            data
+        )
+
+        if (requestCode != REQUEST_SCREEN_CAPTURE) {
+            return
+        }
+
+        if (resultCode == RESULT_OK && data != null) {
+
+            val oldCapture = File(
+                filesDir,
+                ScreenCaptureService.CAPTURE_FILE_NAME
+            )
+
+            oldCapture.delete()
+
+            val serviceIntent = Intent(
+                this,
+                ScreenCaptureService::class.java
+            ).apply {
+                putExtra(
+                    ScreenCaptureService.EXTRA_RESULT_CODE,
+                    resultCode
+                )
+
+                putExtra(
+                    ScreenCaptureService.EXTRA_RESULT_DATA,
+                    data
+                )
             }
+
+            try {
+                startForegroundService(serviceIntent)
+
+                statusText.text =
+                    "Status: Screen Capture sedang berjalan. Periksa notifikasi Android."
+
+            } catch (e: Exception) {
+
+                statusText.text =
+                    "Gagal memulai Screen Capture: ${e.message}"
+            }
+
+        } else {
+
+            statusText.text =
+                "Status: Izin Screen Capture ditolak."
         }
     }
 
-    private fun isAccessibilityServiceEnabled(): Boolean {
-        val expected = ComponentName(this, AutoBagAccessibilityService::class.java)
-        val enabledServices = Settings.Secure.getString(
-            contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: return false
+    private fun stopScreenCapture() {
 
-        return enabledServices.split(':').any { flattened ->
-            ComponentName.unflattenFromString(flattened) == expected
+        val serviceIntent = Intent(
+            this,
+            ScreenCaptureService::class.java
+        )
+
+        val stopped = stopService(serviceIntent)
+
+        statusText.text = if (stopped) {
+            "Status: Permintaan penghentian Screen Capture berhasil."
+        } else {
+            "Status: Tidak ada layanan Screen Capture yang aktif."
         }
     }
 
-    private fun marginParams(bottom: Int = 0): LinearLayout.LayoutParams {
+    private fun showLatestCapture() {
+
+        val imageFile = File(
+            filesDir,
+            ScreenCaptureService.CAPTURE_FILE_NAME
+        )
+
+        if (!imageFile.exists()) {
+
+            statusText.text =
+                "Belum ada gambar. Jalankan Screen Capture terlebih dahulu."
+
+            return
+        }
+
+        val bitmap = BitmapFactory.decodeFile(
+            imageFile.absolutePath
+        )
+
+        if (bitmap == null) {
+
+            statusText.text =
+                "Gambar ditemukan tetapi tidak dapat dibaca."
+
+            return
+        }
+
+        previewImage.setImageBitmap(bitmap)
+
+        statusText.text =
+            "Berhasil membaca gambar tangkapan: ${bitmap.width} x ${bitmap.height}"
+    }
+
+    private fun marginParams(
+        bottom: Int = 0
+    ): LinearLayout.LayoutParams {
+
         return LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
@@ -117,6 +279,8 @@ class MainActivity : Activity() {
     }
 
     private fun dp(value: Int): Int {
-        return (value * resources.displayMetrics.density).toInt()
+        return (
+            value * resources.displayMetrics.density
+        ).toInt()
     }
 }
