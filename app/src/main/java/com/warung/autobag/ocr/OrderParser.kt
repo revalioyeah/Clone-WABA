@@ -38,7 +38,7 @@ data class OrderParseResult(
 object OrderParser {
 
     private val quantityPattern = Regex(
-        """(?i)(?<!\d)([0-9o]{1,2})\s*[/|]\s*(\d{1,2})(?!\d)"""
+        """(?i)(?<!\d)([0-9o]{0,2})\s*[/|]\s*(\d{1,2})(?!\d)"""
     )
 
     private const val BOARD_HORIZONTAL_PADDING = 260
@@ -93,7 +93,7 @@ object OrderParser {
     )
 
     private data class QuantityFragment(
-        val current: Int,
+        val current: Int?,
         val required: Int,
         val box: Box,
         val column: Int,
@@ -212,7 +212,9 @@ object OrderParser {
 
                 val required = match.groupValues[2].toIntOrNull()
 
-                if (current != null && required != null) {
+                // Pembilang boleh tidak terbaca OCR.
+                // Penyebut tetap harus berhasil dikenali.
+                if (required != null) {
 
                     val box = boundsForRange(
                         content = content,
