@@ -2,9 +2,10 @@
 package com.warung.autobag.ocr
 
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
- * Satu item pesanan yang berhasil dipisahkan dari OCR.
+ * Satu item pesanan yang berhasil dipisahkan.
  */
 data class ParsedOrderItem(
     val name: String,
@@ -23,412 +24,434 @@ data class OrderParseResult(
 )
 
 /**
- * Parser pesanan dinamis berdasarkan posisi header PESANAN.
+ * Smart Order Parser.
  *
- * Tidak menggunakan koordinat absolut yang dikunci
- * pada satu resolusi layar.
+ * Fitur:
+ * 1. Mendeteksi header PESANAN.
+ * 2. Membatasi pembacaan pada area papan pesanan.
+ * 3. Memisahkan dua kolom berdasarkan koordinat X.
+ * 4. Memisahkan baris berdasarkan koordinat Y.
+ * 5. Membaca nama barang dan jumlah dalam satu baris OCR.
+ * 6. Memasangkan jumlah dengan barang berdasarkan posisi.
  */
 object OrderParser {
 
-    /**
-     * Mendukung:
-     * 0/1
-     * o/1
-     * O/1
-     * 1/3
-     * 2/3
-     */
     private val quantityPattern = Regex(
-        """([0-9Oo]{1,2})\s*[/|]\s*([0-9Oo]{1,2})"""
+        """(?i)([0o])\s*[/|]\s*(\d{1,2})"""
     )
 
     /**
-     * Katalog barang yang sudah dikenali dari gameplay.
+     * Daftar nama barang yang digunakan dalam game.
      *
-     * Barang baru tetap dapat diterima jika mempunyai
-     * informasi jumlah yang berhasil dibaca.
+     * Tambahkan nama barang baru jika diperlukan.
      */
-    private val knownItems = setOf(
+    private val catalogItems = listOf(
+        "Minuman energi",
+        "Makanan kucing",
+        "Air mineral",
+        "Kopi sachet",
         "Mie goreng",
         "Mie rebus",
-        "Beras",
-        "Obat",
         "Buku tulis",
-        "Galon",
-        "Telur",
-        "Makanan kucing",
-        "Kopi sachet",
-        "Sayuran",
-        "Ciki",
-        "Roti",
         "Rengginang",
-        "Permen",
-        "Jamu",
+        "Teh botol",
         "Kopi susu",
         "Biskuit",
-        "Teh botol",
-        "Minuman energi",
-        "Air mineral",
-        "Kerupuk"
-    ).map { normalizeItemName(it) }.toSet()
+        "Sayuran",
+        "Kerupuk",
+        "Roti",
+        "Beras",
+        "Galon",
+        "Telur",
+        "Permen",
+        "Obat",
+        "Ciki",
+        "Jamu"
+    ).sortedByDescending { normalize(it).length }
 
-    /**
-     * Baris teks sementara untuk pengelompokan OCR.
-     */
-    private data class TextRow(
-        val lines: MutableList<RecognizedLine>,
-        var centerY: Float
+    private data class ItemFragment(
+        val name: String,
+        val centerX: Float,
+        val centerY: Float,
+        val row: Int,
+        val column: Int,
+        val rawText: String
+    )
+
+    private data class QuantityFragment(
+        val current: Int,
+        val required: Int,
+        val centerX: Float,
+        val centerY: Float,
+        val row: Int,
+        val column: Int,
+        val rawText: String
     )
 
     /**
-     * Fungsi utama parsing pesanan.
+     * Fungsi utama parsing.
      */
     fun parse(result: OcrResult): OrderParseResult {
 
-        // ==========================================
-        // 1. DETEKSI HEADER PESANAN
-        // ==========================================
-
+        // 1. Cari header PESANAN.
         val header = result.lines.firstOrNull { line ->
-
-            normalizeHeader(line.text).contains("PESANAN")
+            normalize(line.text).contains("PESANAN")
         }
 
         if (header == null) {
-
             return OrderParseResult(
                 items = emptyList(),
                 headerFound = false,
-                message = "Panel PESANAN belum ditemukan."
+                message = "Papan PESANAN belum ditemukan."
             )
         }
 
-        val headerWidth =
-            (header.right - header.left).coerceAtLeast(1)
+        val headerBottom = header.bottom
+        val headerCenterX =
+            (header.left + header.right) / 2f
 
-        val headerHeight =
-            (header.bottom - header.top).coerceAtLeast(1)
+        // 2. Tentukan area papan pesanan.
+        //
+        // Batas dibuat lebih luas agar kedua kolom
+        // dapat dibaca secara bersamaan.
 
-        // ==========================================
-        // 2. HITUNG AREA PANEL SECARA DINAMIS
-        // ==========================================
+        val minX = header.left - 180
+        val maxX = header.right + 220
+        val maxY = headerBottom + 190
 
-        val horizontalMargin = maxOf(
-            headerWidth,
-            headerHeight * 4
-        )
+        val boardLines = result.lines.filter { line ->
 
-        val minX = header.left - horizontalMargin
-        val maxX = header.right + horizontalMargin
+            val centerX =
+                (line.left + line.right) / 2
 
-        /*
-         * Batas vertikal lebih pendek daripada versi lama.
-         * Menghindari teks pelanggan dan dialog ikut terbaca.
-         */
-        val verticalLimit = maxOf(
-            headerHeight * 12,
-            (headerWidth * 2.5f).toInt()
-        )
-
-        val maxY = header.bottom + verticalLimit
-
-        // ==========================================
-        // 3. FILTER TEKS DI DALAM PANEL
-        // ==========================================
-
-        val candidates = result.lines.filter { line ->
-
-            val centerX = (line.left + line.right) / 2
-
-            val validHorizontal =
-                centerX in minX..maxX
-
-            val validVertical =
-                line.top > header.bottom &&
+            centerX in minX..maxX &&
+                line.top > headerBottom &&
                 line.top <= maxY
-
-            val notHeader =
-                !normalizeHeader(line.text).contains("PESANAN")
-
-            validHorizontal &&
-                validVertical &&
-                notHeader &&
-                line.text.isNotBlank()
-
         }
 
-        if (candidates.isEmpty()) {
-
+        if (boardLines.isEmpty()) {
             return OrderParseResult(
                 items = emptyList(),
                 headerFound = true,
-                message = "Header ditemukan, tetapi teks barang belum terbaca."
+                message = "Header ditemukan, tetapi isi papan belum terbaca."
             )
         }
 
-        // ==========================================
-        // 4. HITUNG TOLERANSI PENGELOMPOKAN
-        // ==========================================
+        val itemFragments =
+            mutableListOf<ItemFragment>()
 
-        val lineHeights = candidates.map { line ->
+        val quantityFragments =
+            mutableListOf<QuantityFragment>()
 
-            (line.bottom - line.top).coerceAtLeast(1)
+        // 3. Pisahkan teks dan angka jumlah.
+        //
+        // Contoh:
+        // "Kopi sachet 0/1"
+        // "0/1 Sayuran"
+        // "0/1 Rengginang 0/1"
 
-        }.sorted()
+        for (line in boardLines) {
 
-        val medianHeight =
-            lineHeights[lineHeights.size / 2]
+            val text = line.text
 
-        val rowTolerance = maxOf(
-            8,
-            minOf(
-                headerHeight,
-                (medianHeight * 1.35f).toInt()
-            )
-        )
+            if (text.isBlank()) continue
 
-        // ==========================================
-        // 5. KELOMPOKKAN TEKS BERDASARKAN BARIS
-        // ==========================================
+            val lineWidth =
+                (line.right - line.left)
+                    .coerceAtLeast(1)
+                    .toFloat()
 
-        val rows = mutableListOf<TextRow>()
-
-        val sortedCandidates = candidates.sortedWith(
-            compareBy<RecognizedLine> {
-                (it.top + it.bottom) / 2
-            }.thenBy {
-                it.left
-            }
-        )
-
-        for (line in sortedCandidates) {
+            val charWidth =
+                lineWidth / text.length.coerceAtLeast(1)
 
             val centerY =
                 (line.top + line.bottom) / 2f
 
-            val matchingRow = rows.minByOrNull { row ->
+            val row = calculateRow(
+                centerY,
+                headerBottom
+            )
 
-                abs(row.centerY - centerY)
+            if (row !in 0..4) continue
 
-            }?.takeIf { row ->
+            val matches =
+                quantityPattern.findAll(text).toList()
 
-                abs(row.centerY - centerY) <=
-                    rowTolerance.toFloat()
-            }
+            var cursor = 0
 
-            if (matchingRow != null) {
+            // Fungsi untuk membaca potongan nama barang.
+            fun addItemSegment(
+                start: Int,
+                end: Int
+            ) {
 
-                matchingRow.lines.add(line)
+                if (start >= end) return
 
-                // Perbarui titik tengah baris.
-                matchingRow.centerY =
-                    matchingRow.lines.map {
-                        (it.top + it.bottom) / 2f
-                    }.average().toFloat()
+                val segment =
+                    text.substring(start, end).trim()
 
-            } else {
+                if (segment.isBlank()) return
 
-                rows.add(
-                    TextRow(
-                        lines = mutableListOf(line),
-                        centerY = centerY
+                val matchedItem =
+                    findCatalogItem(segment)
+                        ?: return
+
+                // Perkiraan posisi teks berdasarkan
+                // posisi karakter pada bounding box OCR.
+                val centerChar =
+                    (start + end) / 2f
+
+                val centerX =
+                    line.left + centerChar * charWidth
+
+                val column =
+                    if (centerX < headerCenterX) 0 else 1
+
+                itemFragments.add(
+                    ItemFragment(
+                        name = matchedItem,
+                        centerX = centerX,
+                        centerY = centerY,
+                        row = row,
+                        column = column,
+                        rawText = segment
                     )
                 )
             }
+
+            // Pisahkan semua angka jumlah.
+            for (match in matches) {
+
+                // Teks sebelum angka jumlah.
+                addItemSegment(
+                    cursor,
+                    match.range.first
+                )
+
+                // Posisi angka jumlah.
+                val quantityCenterChar =
+                    (
+                        match.range.first +
+                            match.range.last + 1
+                    ) / 2f
+
+                val quantityCenterX =
+                    line.left +
+                        quantityCenterChar * charWidth
+
+                val column =
+                    if (
+                        quantityCenterX < headerCenterX
+                    ) 0 else 1
+
+                val currentText =
+                    match.groupValues[1]
+
+                val current =
+                    if (currentText.equals("o", true)) {
+                        0
+                    } else {
+                        currentText.toIntOrNull()
+                    }
+
+                val required =
+                    match.groupValues[2].toIntOrNull()
+
+                if (current != null && required != null) {
+
+                    quantityFragments.add(
+                        QuantityFragment(
+                            current = current,
+                            required = required,
+                            centerX = quantityCenterX,
+                            centerY = centerY,
+                            row = row,
+                            column = column,
+                            rawText = match.value
+                        )
+                    )
+                }
+
+                cursor = match.range.last + 1
+            }
+
+            // Teks setelah angka jumlah.
+            addItemSegment(
+                cursor,
+                text.length
+            )
         }
 
-        // ==========================================
-        // 6. PARSING NAMA DAN JUMLAH BARANG
-        // ==========================================
+        if (itemFragments.isEmpty()) {
+            return OrderParseResult(
+                items = emptyList(),
+                headerFound = true,
+                message = "Papan ditemukan, tetapi nama barang belum berhasil dikenali."
+            )
+        }
 
-        val parsedItems = rows
-            .sortedBy { it.centerY }
-            .mapNotNull { row ->
+        // 4. Urutkan barang berdasarkan baris dan kolom.
+        val sortedItems =
+            itemFragments.sortedWith(
+                compareBy<ItemFragment> { it.row }
+                    .thenBy { it.column }
+                    .thenBy { it.centerX }
+            )
 
-                val rowText = row.lines
-                    .sortedBy { it.left }
-                    .joinToString(" ") { it.text }
-                    .trim()
+        // 5. Pasangkan jumlah dengan barang.
+        //
+        // Barang hanya dipasangkan dengan jumlah
+        // pada baris dan kolom yang sama.
+        // Satu angka tidak boleh dipakai dua kali.
 
-                // Abaikan teks percakapan.
-                if (rowText.contains(":")) {
-                    return@mapNotNull null
-                }
+        val usedQuantities =
+            mutableSetOf<Int>()
 
-                // Cari pola jumlah barang.
-                val quantityMatch =
-                    quantityPattern.find(rowText)
+        val parsedItems =
+            sortedItems.map { item ->
 
-                // Hilangkan angka jumlah dari teks nama.
-                val nameText = cleanItemName(
-                    quantityPattern.replace(rowText, " ")
-                )
+                // Cari jumlah pada sel yang sama.
+                val exactMatch =
+                    quantityFragments
+                        .withIndex()
+                        .filter { (index, quantity) ->
 
-                if (nameText.isBlank()) {
-                    return@mapNotNull null
-                }
+                            index !in usedQuantities &&
+                                quantity.row == item.row &&
+                                quantity.column == item.column
+                        }
+                        .minByOrNull { (_, quantity) ->
 
-                // Validasi katalog.
-                val normalizedName =
-                    normalizeItemName(nameText)
+                            abs(
+                                quantity.centerY -
+                                    item.centerY
+                            ) +
+                                abs(
+                                    quantity.centerX -
+                                        item.centerX
+                                ) * 0.01f
+                        }
 
-                val knownItem =
-                    normalizedName in knownItems
+                // Jika tidak ditemukan, cari jumlah
+                // terdekat pada kolom yang sama.
+                val fallbackMatch =
+                    if (exactMatch == null) {
 
-                /*
-                 * Teks tanpa jumlah hanya diterima apabila
-                 * namanya cocok dengan katalog barang.
-                 *
-                 * Ini mencegah nama pelanggan menjadi barang.
-                 */
-                if (
-                    quantityMatch == null &&
-                    !knownItem
-                ) {
-                    return@mapNotNull null
-                }
+                        quantityFragments
+                            .withIndex()
+                            .filter { (index, quantity) ->
 
-                /*
-                 * Jika OCR membaca jumlah:
-                 * O/1 -> 0/1
-                 * o/3 -> 0/3
-                 */
-                val currentQuantity =
-                    quantityMatch
-                        ?.groupValues
-                        ?.get(1)
-                        ?.let { parseNumber(it) }
+                                index !in usedQuantities &&
+                                    quantity.column == item.column &&
+                                    abs(
+                                        quantity.centerY -
+                                            item.centerY
+                                    ) <= 35f
+                            }
+                            .minByOrNull { (_, quantity) ->
 
-                val requiredQuantity =
-                    quantityMatch
-                        ?.groupValues
-                        ?.get(2)
-                        ?.let { parseNumber(it) }
+                                abs(
+                                    quantity.centerY -
+                                        item.centerY
+                                )
+                            }
 
-                /*
-                 * Tolak jumlah yang tidak berhasil
-                 * dinormalisasi.
-                 */
-                if (
-                    quantityMatch != null &&
-                    (
-                        currentQuantity == null ||
-                        requiredQuantity == null
-                    )
-                ) {
-                    return@mapNotNull null
-                }
+                    } else {
+                        null
+                    }
+
+                val selected =
+                    exactMatch ?: fallbackMatch
+
+                val quantity =
+                    selected?.let {
+
+                        usedQuantities.add(it.index)
+
+                        it.value
+                    }
 
                 ParsedOrderItem(
-                    name = nameText,
-                    currentQuantity = currentQuantity,
-                    requiredQuantity = requiredQuantity,
-                    rawText = rowText
+                    name = item.name,
+                    currentQuantity = quantity?.current,
+                    requiredQuantity = quantity?.required,
+                    rawText = if (quantity != null) {
+                        "${item.rawText} | ${quantity.rawText}"
+                    } else {
+                        item.rawText
+                    }
                 )
             }
 
-        // ==========================================
-        // 7. HASIL AKHIR
-        // ==========================================
-
-        val missingQuantityCount = parsedItems.count {
-
-            it.currentQuantity == null ||
-                it.requiredQuantity == null
-        }
-
-        val message = when {
-
-            parsedItems.isEmpty() -> {
-                "Panel ditemukan, tetapi belum ada item yang berhasil divalidasi."
-            }
-
-            missingQuantityCount > 0 -> {
-                "${parsedItems.size} item ditemukan. " +
-                    "$missingQuantityCount item perlu verifikasi jumlah."
-            }
-
-            else -> {
-                "${parsedItems.size} item pesanan berhasil dipisahkan."
-            }
-        }
-
+        // 6. Hasil akhir.
         return OrderParseResult(
             items = parsedItems,
             headerFound = true,
-            message = message
+            message = if (parsedItems.isEmpty()) {
+                "Papan pesanan ditemukan, tetapi item belum berhasil dipisahkan."
+            } else {
+                "${parsedItems.size} item pesanan berhasil dipisahkan."
+            }
         )
     }
 
     /**
-     * Membersihkan nama barang.
+     * Menghitung baris berdasarkan posisi vertikal.
+     *
+     * Baris pertama dimulai sekitar 28 piksel
+     * setelah batas bawah header.
+     *
+     * Jarak antarbaris sekitar 50 piksel.
      */
-    private fun cleanItemName(text: String): String {
+    private fun calculateRow(
+        centerY: Float,
+        headerBottom: Int
+    ): Int {
 
-        var cleaned = text
-            .replace(
-                Regex("""[^\p{L}\p{N}\s'-]"""),
-                " "
-            )
-            .replace(
-                Regex("""\s+"""),
-                " "
-            )
-            .trim()
+        val firstRowCenter =
+            headerBottom + 28f
 
-        var tokens = cleaned
-            .split(Regex("""\s+"""))
-            .filter { it.isNotBlank() }
+        val rowHeight = 50f
 
-        /*
-         * Mengatasi karakter OCR yang terselip:
-         * d Mie rebus -> Mie rebus
-         */
-        if (
-            tokens.size > 1 &&
-            tokens.first().length == 1
-        ) {
-            tokens = tokens.drop(1)
+        return (
+            (centerY - firstRowCenter) /
+                rowHeight
+            ).roundToInt()
+    }
+
+    /**
+     * Mencari nama barang dalam potongan teks OCR.
+     */
+    private fun findCatalogItem(
+        text: String
+    ): String? {
+
+        val normalizedText =
+            normalize(text)
+
+        if (normalizedText.isBlank()) {
+            return null
         }
 
-        cleaned = tokens.joinToString(" ")
+        return catalogItems.firstOrNull { item ->
 
-        return cleaned.trim()
+            normalizedText.contains(
+                normalize(item)
+            )
+        }
     }
 
     /**
-     * Mengubah O dan o menjadi angka nol.
+     * Normalisasi teks untuk pencocokan.
      */
-    private fun parseNumber(value: String): Int? {
-
-        return value
-            .replace('O', '0')
-            .replace('o', '0')
-            .toIntOrNull()
-    }
-
-    /**
-     * Normalisasi nama untuk pencocokan katalog.
-     */
-    private fun normalizeItemName(text: String): String {
+    private fun normalize(
+        text: String
+    ): String {
 
         return text
             .uppercase()
             .replace(
                 Regex("""[^A-Z0-9]"""),
-                ""
-            )
-    }
-
-    /**
-     * Normalisasi header OCR.
-     */
-    private fun normalizeHeader(text: String): String {
-
-        return text
-            .uppercase()
-            .replace(
-                Regex("""[^A-Z]"""),
                 ""
             )
     }
