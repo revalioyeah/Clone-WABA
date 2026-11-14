@@ -85,6 +85,53 @@ object GestureController {
     }
 
     /**
+     * Maps a product point once, then dispatches a short sequential tap batch.
+     */
+    fun executeTapBatchFromImage(
+        sourceImagePoint: ScreenPoint,
+        imageWidth: Int,
+        imageHeight: Int,
+        tapCount: Int,
+        durationMs: Long = TargetGameConfig.TAP_DURATION_MS,
+        intervalMs: Long = TargetGameConfig.TAP_INTERVAL_MS,
+        onComplete: (Boolean, String, Int) -> Unit
+    ): Boolean {
+        val service = GestureAccessibilityService.instance
+        if (service == null) {
+            onComplete(false, "Accessibility Service belum aktif.", 0)
+            return false
+        }
+
+        val metrics = DisplayMetrics()
+        val windowManager = service.getSystemService(WindowManager::class.java)
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+
+        val source = mapImagePointToScreen(
+            sourceImagePoint.x,
+            sourceImagePoint.y,
+            imageWidth,
+            imageHeight,
+            metrics.widthPixels,
+            metrics.heightPixels
+        )
+
+        if (source == null) {
+            onComplete(false, "Pemetaan koordinat produk ke layar gagal.", 0)
+            return false
+        }
+
+        return service.tapRepeated(
+            x = source.x,
+            y = source.y,
+            tapCount = tapCount,
+            durationMs = durationMs,
+            intervalMs = intervalMs,
+            onComplete = onComplete
+        )
+    }
+
+    /**
      * Mengirim satu drag berdasarkan koordinat pada screenshot OCR.
      * Ukuran layar dibaca dari Accessibility Service saat gesture dikirim,
      * bukan dari Activity yang mungkin sedang berada pada orientasi berbeda.
