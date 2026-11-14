@@ -4,20 +4,19 @@ package com.warung.autobag.gesture
  * Coordinates one-item-at-a-time tap-to-bag order execution.
  *
  * Safety model:
- * - Exactly one tap is dispatched at a time.
+ * - Up to two taps for the same product may be dispatched as a short batch.
  * - A successful Android tap is NOT treated as proof that the game
- *   accepted the product. A fresh OCR quantity snapshot must confirm it.
- * - The next tap is not dispatched until the previous quantity increases
- *   by exactly one.
+ *   accepted the products. One fresh OCR quantity snapshot confirms the batch.
+ * - The next batch is not dispatched until OCR confirms the registered quantity
+ *   from the previous batch; partial success is accepted only after fresh OCR.
  * - A failed or ambiguous verification pauses the queue; it never retries
  *   blindly, preventing accidental duplicate products.
- * - Pause takes effect after an in-flight tap finishes. Stop prevents
- *   all subsequent taps, although Android may finish a tap already
- *   dispatched because AccessibilityService has no reliable cancellation
- *   API for an individual dispatchGesture call.
+ * - Pause cancels any not-yet-dispatched tap in the current batch. Android
+ *   may finish the tap already in progress because an individual
+ *   dispatchGesture call cannot be reliably cancelled.
  *
  * The caller supplies calibrated physical screen coordinates and connects
- * [TapDispatcher] to GestureController.executeTapFromImage().
+ * [TapDispatcher] to GestureController.executeTapBatchFromImage().
  */
 class OrderExecutionManager(
     private val tapDispatcher: TapDispatcher,
@@ -57,7 +56,8 @@ class OrderExecutionManager(
     fun interface TapDispatcher {
         fun dispatch(
             source: PixelPoint,
-            onComplete: (Boolean, String) -> Unit
+            tapCount: Int,
+            onComplete: (Boolean, String, Int) -> Unit
         )
     }
 
@@ -82,6 +82,7 @@ class OrderExecutionManager(
     private var taskIndex = 0
     private var tapInFlight = false
     private var awaitingVerification = false
+    private var pendingBatchCount = 0
     private var pauseRequested = false
     private var runToken = 0
     private var dispatchedTaps = 0
@@ -143,6 +144,7 @@ class OrderExecutionManager(
         taskIndex = 0
         tapInFlight = false
         awaitingVerification = false
+        pendingBatchCount = 0
         pauseRequested = false
         dispatchedTaps = 0
 
@@ -153,7 +155,7 @@ class OrderExecutionManager(
         }
 
         state = State.RUNNING
-        publish("Antrean dimulai. Barang diproses satu per satu dan setiap tap wajib diverifikasi.")
+        publish("Antrean dimulai. Maksimal dua tap per barang dikirim dalam batch dan diverifikasi sebelum batch berikutnya.")
         dispatchCurrentItem()
     }
 
@@ -208,6 +210,7 @@ class OrderExecutionManager(
         taskIndex = 0
         tapInFlight = false
         awaitingVerification = false
+        pendingBatchCount = 0
         pauseRequested = false
         state = State.STOPPED
         publish("Antrean dihentikan. Tidak ada tap lanjutan yang akan dikirim.")
@@ -248,14 +251,22 @@ class OrderExecutionManager(
             return
         }
 
-        val expected = task.currentQuantity + 1
-        if (observedCurrentQuantity != expected) {
-            pauseWithVerification("Verifikasi belum cocok. Sebelum tap: ${task.currentQuantity}/${task.requiredQuantity}; terbaca: $observedCurrentQuantity/$observedRequiredQuantity; seharusnya: $expected/$observedRequiredQuantity. Tidak akan mengulang tap otomatis.")
+        val minimumExpected = task.currentQuantity + 1
+        val maximumExpected = task.currentQuantity + pendingBatchCount.coerceAtLeast(1)
+        if (observedCurrentQuantity !in minimumExpected..maximumExpected) {
+            pauseWithVerification(
+                "Verifikasi batch belum cocok. Sebelum tap: ${task.currentQuantity}/${task.requiredQuantity}; " +
+                    "terbaca: $observedCurrentQuantity/$observedRequiredQuantity; " +
+                    "rentang yang diharapkan: $minimumExpected-$maximumExpected. Tidak ada tap ulang otomatis."
+            )
             return
         }
 
+        // Accept a partial batch if the game registered only one of two taps.
+        // The remaining quantity is recalculated and sent as a new small batch.
         task.currentQuantity = observedCurrentQuantity
         awaitingVerification = false
+        pendingBatchCount = 0
         publish("Terverifikasi: ${task.itemName} ${task.currentQuantity}/${task.requiredQuantity}.")
 
         if (task.currentQuantity >= task.requiredQuantity) {
@@ -309,38 +320,71 @@ class OrderExecutionManager(
             return
         }
 
+        val remaining = (task.requiredQuantity - task.currentQuantity).coerceAtLeast(0)
+        if (remaining == 0) {
+            taskIndex++
+            dispatchCurrentItem()
+            return
+        }
+
+        // Batch up to two taps for the same product, then verify once.
+        // This removes one full screenshot/OCR round trip for 2-unit orders.
+        val requestedBatchCount = minOf(
+            remaining,
+            TargetGameConfig.MAX_TAPS_PER_BATCH
+        ).coerceAtLeast(1)
+
         val token = runToken
         tapInFlight = true
-        publish("Mengetuk ${task.itemName}: ${task.currentQuantity}/${task.requiredQuantity} → ${task.currentQuantity + 1}/${task.requiredQuantity}.")
+        pendingBatchCount = 0
+        publish(
+            "Mengetuk ${task.itemName}: ${task.currentQuantity}/${task.requiredQuantity}; " +
+                "$requestedBatchCount tap dalam satu batch."
+        )
 
         try {
-            tapDispatcher.dispatch(task.source) { success, detail ->
+            tapDispatcher.dispatch(task.source, requestedBatchCount) { success, detail, completedCount ->
                 if (token != runToken || state == State.STOPPED) return@dispatch
 
                 tapInFlight = false
-                if (!success) {
-                    state = State.PAUSED
-                    pauseRequested = true
-                    publish("Tap gagal: $detail. Antrean dijeda; periksa posisi layar sebelum melanjutkan.")
+                val actualCompleted = completedCount.coerceIn(0, requestedBatchCount)
+                if (actualCompleted > 0) {
+                    dispatchedTaps += actualCompleted
+                    pendingBatchCount = actualCompleted
+                    awaitingVerification = true
+
+                    if (pauseRequested || state == State.PAUSED) {
+                        state = State.PAUSED
+                        publish(
+                            "$actualCompleted tap selesai dikirim. Memverifikasi hasil sebelum melanjutkan."
+                        )
+                    } else if (!success) {
+                        state = State.WAITING_VERIFICATION
+                        publish(
+                            "Batch tap terhenti setelah $actualCompleted tap. Memverifikasi progres yang sudah terjadi."
+                        )
+                    } else {
+                        state = State.WAITING_VERIFICATION
+                        publish(
+                            "Batch $actualCompleted tap untuk ${task.itemName} selesai. Memverifikasi jumlah."
+                        )
+                    }
+                    notifyVerificationRequired()
                     return@dispatch
                 }
 
-                dispatchedTaps++
-                awaitingVerification = true
-
-                if (pauseRequested || state == State.PAUSED) {
-                    state = State.PAUSED
-                    publish("Tap ${task.itemName} selesai dikirim. Proses dijeda dan menunggu verifikasi jumlah.")
-                } else {
-                    state = State.WAITING_VERIFICATION
-                    publish("Tap ${task.itemName} selesai dikirim. Menunggu OCR untuk memastikan jumlah bertambah satu.")
-                }
-                notifyVerificationRequired()
+                state = State.PAUSED
+                pauseRequested = true
+                pendingBatchCount = 0
+                publish(
+                    "Tap tidak berhasil dikirim: $detail. Antrean dijeda tanpa mengirim ulang otomatis."
+                )
             }
         } catch (exception: Exception) {
             tapInFlight = false
             state = State.PAUSED
             pauseRequested = true
+            pendingBatchCount = 0
             publish("Dispatcher mengalami kesalahan: ${exception.message ?: "tidak diketahui"}. Antrean dijeda.")
         }
     }
@@ -350,7 +394,7 @@ class OrderExecutionManager(
         listener.onVerificationRequired(
             itemName = task.itemName,
             previousQuantity = task.currentQuantity,
-            expectedQuantity = task.currentQuantity + 1,
+            expectedQuantity = task.currentQuantity + pendingBatchCount.coerceAtLeast(1),
             requiredQuantity = task.requiredQuantity
         )
     }
@@ -369,6 +413,7 @@ class OrderExecutionManager(
         taskIndex = 0
         tapInFlight = false
         awaitingVerification = false
+        pendingBatchCount = 0
         pauseRequested = false
         publish(reason)
     }
