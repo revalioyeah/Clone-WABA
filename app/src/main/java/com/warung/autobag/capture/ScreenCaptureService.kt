@@ -24,6 +24,7 @@ import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
 import android.view.WindowManager
+import com.warung.autobag.gesture.GestureAccessibilityService
 import java.io.File
 import java.io.FileOutputStream
 
@@ -43,6 +44,10 @@ class ScreenCaptureService : Service() {
         private const val NOTIFICATION_ID = 2001
         private const val REQUEST_STOP = 2002
         private const val CAPTURE_INTERVAL_MS = 1000L
+
+        @Volatile
+        var isRunning: Boolean = false
+            private set
     }
 
     private var projection: MediaProjection? = null
@@ -54,6 +59,8 @@ class ScreenCaptureService : Service() {
     private var workerHandler: Handler? = null
 
     private var lastSavedAt = 0L
+    private var lastForegroundCheckAt = 0L
+    private var cachedGameForeground = true
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -216,6 +223,8 @@ class ScreenCaptureService : Service() {
             )
         }
 
+        isRunning = true
+
         Log.i(
             TAG,
             "Screen capture aktif: ${width}x${height}"
@@ -223,16 +232,21 @@ class ScreenCaptureService : Service() {
     }
 
     private fun saveLatestFrame(reader: ImageReader) {
-
         val now = SystemClock.elapsedRealtime()
+        val image = reader.acquireLatestImage() ?: return
 
-        if (now - lastSavedAt < CAPTURE_INTERVAL_MS) {
-            val skippedImage = reader.acquireLatestImage()
-            skippedImage?.close()
-            return
+        // Capture hanya menyimpan frame game. Pemeriksaan foreground dibatasi
+        // maksimal dua kali per detik agar tidak membebani callback tiap frame.
+        if (now - lastForegroundCheckAt >= 500L) {
+            lastForegroundCheckAt = now
+            val accessibility = GestureAccessibilityService.instance
+            cachedGameForeground = accessibility == null || accessibility.isTargetGameForeground()
         }
 
-        val image = reader.acquireLatestImage() ?: return
+        if (now - lastSavedAt < CAPTURE_INTERVAL_MS || !cachedGameForeground) {
+            image.close()
+            return
+        }
 
         try {
             val width = image.width
@@ -368,6 +382,7 @@ class ScreenCaptureService : Service() {
 
     private fun releaseResources(stopProjection: Boolean) {
 
+        isRunning = false
         virtualDisplay?.release()
         virtualDisplay = null
 
