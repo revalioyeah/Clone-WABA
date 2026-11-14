@@ -1,4 +1,3 @@
-
 package com.warung.autobag.ocr
 
 import android.graphics.Bitmap
@@ -7,10 +6,11 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 
 /**
- * Data satu baris teks yang berhasil dikenali OCR.
- * Koordinat menggunakan posisi asli pada gambar.
+ * Satu elemen/kata yang dikenali OCR beserta koordinat aslinya.
+ *
+ * Koordinat menggunakan sistem koordinat Bitmap sumber.
  */
-data class RecognizedLine(
+data class RecognizedElement(
     val text: String,
     val left: Int,
     val top: Int,
@@ -19,7 +19,25 @@ data class RecognizedLine(
 )
 
 /**
+ * Satu baris teks hasil OCR.
+ *
+ * Properti elements memiliki nilai default agar pemanggilan lama
+ * yang hanya mengirim lima parameter tetap kompatibel.
+ */
+data class RecognizedLine(
+    val text: String,
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int,
+    val elements: List<RecognizedElement> = emptyList()
+)
+
+/**
  * Hasil keseluruhan proses OCR.
+ *
+ * Struktur OcrResult dipertahankan agar pemanggilan lama
+ * OcrResult(fullText, lines) tetap kompatibel.
  */
 data class OcrResult(
     val fullText: String,
@@ -28,6 +46,11 @@ data class OcrResult(
 
 /**
  * Mesin OCR lokal menggunakan Google ML Kit.
+ *
+ * Selain teks per baris, recognizer sekarang menyimpan koordinat
+ * setiap Text.Element agar parser dapat membedakan teks dari
+ * kolom kiri dan kanan meskipun ML Kit menggabungkannya dalam
+ * satu baris OCR.
  */
 class OrderTextRecognizer {
 
@@ -44,7 +67,6 @@ class OrderTextRecognizer {
         onSuccess: (OcrResult) -> Unit,
         onFailure: (Exception) -> Unit
     ) {
-
         if (bitmap.isRecycled) {
             onFailure(
                 IllegalArgumentException(
@@ -54,13 +76,9 @@ class OrderTextRecognizer {
             return
         }
 
-        val image = InputImage.fromBitmap(
-            bitmap,
-            0
-        )
+        val image = InputImage.fromBitmap(bitmap, 0)
 
         recognizer.process(image)
-
             .addOnSuccessListener { visionText ->
 
                 val recognizedLines =
@@ -68,29 +86,44 @@ class OrderTextRecognizer {
 
                         block.lines.mapNotNull { line ->
 
-                            val bounds = line.boundingBox
+                            val lineBounds = line.boundingBox
                                 ?: return@mapNotNull null
+
+                            val recognizedElements =
+                                line.elements.mapNotNull { element ->
+
+                                    val elementBounds =
+                                        element.boundingBox
+                                            ?: return@mapNotNull null
+
+                                    RecognizedElement(
+                                        text = element.text,
+                                        left = elementBounds.left,
+                                        top = elementBounds.top,
+                                        right = elementBounds.right,
+                                        bottom = elementBounds.bottom
+                                    )
+                                }
 
                             RecognizedLine(
                                 text = line.text,
-                                left = bounds.left,
-                                top = bounds.top,
-                                right = bounds.right,
-                                bottom = bounds.bottom
+                                left = lineBounds.left,
+                                top = lineBounds.top,
+                                right = lineBounds.right,
+                                bottom = lineBounds.bottom,
+                                elements = recognizedElements
                             )
                         }
                     }
 
-                val result = OcrResult(
-                    fullText = visionText.text,
-                    lines = recognizedLines
+                onSuccess(
+                    OcrResult(
+                        fullText = visionText.text,
+                        lines = recognizedLines
+                    )
                 )
-
-                onSuccess(result)
             }
-
             .addOnFailureListener { exception ->
-
                 onFailure(exception)
             }
     }
