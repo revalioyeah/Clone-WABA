@@ -1,12 +1,12 @@
 package com.warung.autobag.gesture
 
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import kotlin.math.roundToInt
 
 /**
- * Thin controller facade for the order executor.
- *
- * This class deliberately does not start a full order loop yet.
- * It provides a single-item gesture primitive and safe coordinate mapping.
+ * Memetakan koordinat gambar capture ke koordinat layar perangkat,
+ * lalu meneruskan satu gesture hold-and-drag ke Accessibility Service.
  */
 object GestureController {
 
@@ -15,11 +15,6 @@ object GestureController {
         val y: Float
     )
 
-    /**
-     * Converts a point measured in the captured screenshot into physical
-     * display coordinates. The caller must ensure the screenshot and game
-     * viewport have the same orientation and content bounds.
-     */
     fun mapImagePointToScreen(
         imageX: Float,
         imageY: Float,
@@ -31,8 +26,9 @@ object GestureController {
         if (
             imageWidth <= 0 || imageHeight <= 0 ||
             screenWidth <= 0 || screenHeight <= 0 ||
+            !imageX.isFinite() || !imageY.isFinite() ||
             imageX < 0f || imageY < 0f ||
-            imageX > imageWidth || imageY > imageHeight
+            imageX >= imageWidth || imageY >= imageHeight
         ) {
             return null
         }
@@ -43,11 +39,67 @@ object GestureController {
         )
     }
 
+    /**
+     * Mengirim satu drag berdasarkan koordinat pada screenshot OCR.
+     * Ukuran layar dibaca dari Accessibility Service saat gesture dikirim,
+     * bukan dari Activity yang mungkin sedang berada pada orientasi berbeda.
+     */
+    fun executeOneItemFromImage(
+        sourceImagePoint: ScreenPoint,
+        bagImagePoint: ScreenPoint,
+        imageWidth: Int,
+        imageHeight: Int,
+        holdDurationMs: Long = TargetGameConfig.HOLD_DURATION_MS,
+        dragDurationMs: Long = TargetGameConfig.DRAG_DURATION_MS,
+        onComplete: (Boolean, String) -> Unit
+    ): Boolean {
+        val service = GestureAccessibilityService.instance
+        if (service == null) {
+            onComplete(false, "Accessibility Service belum aktif.")
+            return false
+        }
+
+        val metrics = DisplayMetrics()
+        val windowManager = service.getSystemService(WindowManager::class.java)
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+
+        val source = mapImagePointToScreen(
+            sourceImagePoint.x,
+            sourceImagePoint.y,
+            imageWidth,
+            imageHeight,
+            metrics.widthPixels,
+            metrics.heightPixels
+        )
+        val destination = mapImagePointToScreen(
+            bagImagePoint.x,
+            bagImagePoint.y,
+            imageWidth,
+            imageHeight,
+            metrics.widthPixels,
+            metrics.heightPixels
+        )
+
+        if (source == null || destination == null) {
+            onComplete(false, "Pemetaan koordinat gambar ke layar gagal.")
+            return false
+        }
+
+        return executeOneItem(
+            source = source,
+            bag = destination,
+            holdDurationMs = holdDurationMs,
+            dragDurationMs = dragDurationMs,
+            onComplete = onComplete
+        )
+    }
+
     fun executeOneItem(
         source: ScreenPoint,
         bag: ScreenPoint,
-        holdDurationMs: Long = 350L,
-        dragDurationMs: Long = 650L,
+        holdDurationMs: Long = TargetGameConfig.HOLD_DURATION_MS,
+        dragDurationMs: Long = TargetGameConfig.DRAG_DURATION_MS,
         onComplete: (Boolean, String) -> Unit
     ): Boolean {
         val service = GestureAccessibilityService.instance
