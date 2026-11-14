@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Warung Auto Bag Assistant</string>
+    <string name="accessibility_service_label">Warung Auto Bag Assistant</string>
+    <string name="accessibility_service_description">Layanan pendamping untuk menjalankan gesture yang diminta pengguna pada tahap pengembangan berikutnya. Layanan belum melakukan tindakan otomatis pada versi awal.</string>
+</resources>
