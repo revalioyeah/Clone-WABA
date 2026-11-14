@@ -6,7 +6,10 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +21,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.warung.autobag.capture.ScreenCaptureService
+import com.warung.autobag.detection.SmartDetectionResult
+import com.warung.autobag.detection.SmartItemDetector
 import com.warung.autobag.ocr.OrderParser
 import com.warung.autobag.ocr.OrderTextRecognizer
 import java.io.File
@@ -26,15 +31,18 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_SCREEN_CAPTURE = 3101
+        private const val REFERENCE_IMAGE_WIDTH = 2304f
     }
 
     private lateinit var statusText: TextView
     private lateinit var previewImage: ImageView
     private lateinit var orderResultText: TextView
+    private lateinit var detectionResultText: TextView
     private lateinit var ocrResultText: TextView
 
     private var textRecognizer: OrderTextRecognizer? = null
     private var isOcrRunning = false
+    private var displayedBitmap: Bitmap? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,7 +65,7 @@ class MainActivity : Activity() {
         }
 
         val subtitle = TextView(this).apply {
-            text = "Screen Capture & Smart Order Recognition\n\nAmbil gambar layar game, baca papan pesanan, lalu pisahkan nama barang dan jumlahnya."
+            text = "Screen Capture, Smart Order Recognition & Item Detection\n\nAmbil gambar layar game, baca papan pesanan, lalu cari perkiraan lokasi barang pada rak."
             textSize = 15f
             setTextColor(Color.DKGRAY)
         }
@@ -96,19 +104,19 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.rgb(225, 230, 225))
             scaleType = ImageView.ScaleType.FIT_CENTER
             adjustViewBounds = true
-            contentDescription = "Hasil tangkapan layar"
+            contentDescription = "Hasil tangkapan layar dengan penanda lokasi barang"
         }
 
         val orderHeading = createHeading("SMART ORDER RECOGNITION")
 
         val orderDescription = TextView(this).apply {
-            text = "Tekan tombol di bawah untuk membaca teks pada gambar terakhir dan mencoba memisahkan daftar pesanan pelanggan."
+            text = "Baca teks pada gambar terakhir untuk memisahkan nama barang dan jumlah pesanan pelanggan."
             textSize = 14f
             setTextColor(Color.DKGRAY)
         }
 
         val ocrButton = Button(this).apply {
-            text = "BACA PESANAN & TEKS OCR"
+            text = "BACA PESANAN & DETEKSI LOKASI"
             setOnClickListener { runOcr() }
         }
 
@@ -116,8 +124,10 @@ class MainActivity : Activity() {
             text = "BERSIHKAN HASIL"
             setOnClickListener {
                 orderResultText.text = "Belum ada hasil parsing pesanan."
+                detectionResultText.text = "Belum ada hasil deteksi lokasi barang."
                 ocrResultText.text = "Belum ada hasil OCR."
                 statusText.text = "Hasil pembacaan telah dibersihkan."
+                showLatestCapture()
             }
         }
 
@@ -127,6 +137,17 @@ class MainActivity : Activity() {
             text = "Belum ada hasil parsing pesanan."
             textSize = 15f
             setTextColor(Color.rgb(30, 65, 40))
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setTextIsSelectable(true)
+        }
+
+        val detectionHeading = createHeading("SMART ITEM DETECTION")
+
+        detectionResultText = TextView(this).apply {
+            text = "Belum ada hasil deteksi lokasi barang."
+            textSize = 14f
+            setTextColor(Color.rgb(25, 65, 38))
             setBackgroundColor(Color.WHITE)
             setPadding(dp(14), dp(14), dp(14), dp(14))
             setTextIsSelectable(true)
@@ -153,14 +174,15 @@ class MainActivity : Activity() {
                 4. Tunggu sampai papan pesanan pelanggan terlihat.
                 5. Hentikan capture melalui notifikasi Android.
                 6. Kembali ke aplikasi.
-                7. Tekan LIHAT HASIL TANGKAPAN.
-                8. Tekan BACA PESANAN & TEKS OCR.
-                9. Periksa hasil pesanan terstruktur dan diagnostik OCR.
+                7. Tekan BACA PESANAN & DETEKSI LOKASI.
+                8. Periksa daftar pesanan dan penanda hijau pada preview.
+                9. Cocokkan penanda dengan gambar barang yang sebenarnya.
 
-                Catatan:
-                - OCR membaca gambar terakhir yang tersimpan oleh aplikasi.
-                - Parsing pesanan masih tahap pengujian.
-                - Belum ada barang yang diambil atau gesture otomatis yang dijalankan.
+                CATATAN PENTING:
+                - Deteksi versi ini mencocokkan label OCR pada area rak.
+                - Titik hijau adalah estimasi posisi produk berdasarkan label.
+                - Koordinat belum boleh dipakai sebagai koordinat sentuh otomatis.
+                - Belum ada gesture mengambil atau memasukkan barang.
             """.trimIndent()
             textSize = 13f
             setTextColor(Color.DKGRAY)
@@ -193,6 +215,8 @@ class MainActivity : Activity() {
         page.addView(clearButton, marginParams(8))
         page.addView(parsedHeading, marginParams(12))
         page.addView(orderResultText, marginParams(18))
+        page.addView(detectionHeading, marginParams(12))
+        page.addView(detectionResultText, marginParams(18))
         page.addView(rawHeading, marginParams(12))
         page.addView(ocrResultText, marginParams(18))
         page.addView(instruction, marginParams())
@@ -277,6 +301,19 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun setDisplayedBitmap(bitmap: Bitmap) {
+        previewImage.setImageDrawable(null)
+
+        displayedBitmap?.let { oldBitmap ->
+            if (!oldBitmap.isRecycled && oldBitmap !== bitmap) {
+                oldBitmap.recycle()
+            }
+        }
+
+        displayedBitmap = bitmap
+        previewImage.setImageBitmap(bitmap)
+    }
+
     private fun showLatestCapture() {
         val imageFile = File(
             filesDir,
@@ -295,7 +332,7 @@ class MainActivity : Activity() {
             return
         }
 
-        previewImage.setImageBitmap(bitmap)
+        setDisplayedBitmap(bitmap)
         statusText.text =
             "Gambar berhasil dibaca: ${bitmap.width} x ${bitmap.height}"
     }
@@ -440,9 +477,13 @@ class MainActivity : Activity() {
             return
         }
 
+        val imageWidth = bitmap.width
+        val imageHeight = bitmap.height
+
         isOcrRunning = true
-        statusText.text = "Sedang membaca teks dan memproses pesanan..."
+        statusText.text = "Sedang membaca teks dan mencari lokasi barang..."
         orderResultText.text = "Proses pembacaan pesanan sedang berjalan..."
+        detectionResultText.text = "Sedang mencari label barang pada area rak..."
         ocrResultText.text = "Proses OCR sedang berjalan..."
 
         val recognizer = textRecognizer
@@ -452,121 +493,60 @@ class MainActivity : Activity() {
             recognizer.recognize(
                 bitmap = bitmap,
                 onSuccess = { result ->
-                    bitmap.recycle()
+
+                    // Parser dan detector memakai hasil OCR yang sama.
+                    val parsed = OrderParser.parse(result)
+
+                    val detection = SmartItemDetector.detect(
+                        ocrResult = result,
+                        orders = parsed.items,
+                        imageWidth = imageWidth,
+                        imageHeight = imageHeight
+                    )
+
+                    // Buat salinan gambar untuk menggambar penanda.
+                    val annotatedBitmap = createDetectionOverlay(
+                        source = bitmap,
+                        detection = detection
+                    )
+
+                    if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+
                     isOcrRunning = false
 
                     if (isFinishing || isDestroyed) {
+                        annotatedBitmap?.let {
+                            if (!it.isRecycled) it.recycle()
+                        }
                         return@recognize
                     }
 
-                    // Jalankan parser pada hasil OCR yang sama.
-                    val parsed = OrderParser.parse(result)
-
-                    val orderOutput = buildString {
-                        appendLine("STATUS: ${parsed.message}")
-                        appendLine()
-
-                        if (!parsed.headerFound) {
-                            appendLine(
-                                "Papan pesanan belum ditemukan pada gambar."
-                            )
-                            appendLine(
-                                "Pastikan tulisan PESANAN terlihat jelas."
-                            )
-                        } else if (parsed.items.isEmpty()) {
-                            appendLine(
-                                "Header PESANAN ditemukan, tetapi item belum dapat dipisahkan."
-                            )
-                            appendLine(
-                                "Periksa diagnostik OCR di bagian bawah."
-                            )
-                        } else {
-                            appendLine("DAFTAR PESANAN PELANGGAN")
-                            appendLine("========================")
-
-                            parsed.items.forEachIndexed { index, item ->
-                                val current = item.currentQuantity
-                                    ?.toString() ?: "?"
-
-                                val required = item.requiredQuantity
-                                    ?.toString() ?: "?"
-
-                                appendLine(
-                                    "${index + 1}. ${item.name}"
-                                )
-                                appendLine(
-                                    "   Jumlah: $current / $required"
-                                )
-
-                                if (
-                                    item.currentQuantity != null &&
-                                    item.requiredQuantity != null
-                                ) {
-                                    val remaining = (
-                                        item.requiredQuantity -
-                                            item.currentQuantity
-                                    ).coerceAtLeast(0)
-
-                                    appendLine(
-                                        "   Belum terpenuhi: $remaining"
-                                    )
-                                } else {
-                                    appendLine(
-                                        "   Belum dapat menghitung sisa pesanan."
-                                    )
-                                }
-
-                                appendLine()
-                            }
-
-                            appendLine(
-                                "Catatan: hasil ini masih perlu diverifikasi."
-                            )
-                            appendLine(
-                                "Belum ada gesture mengambil atau memasukkan barang."
-                            )
-                        }
+                    if (annotatedBitmap != null) {
+                        setDisplayedBitmap(annotatedBitmap)
                     }
 
-                    val rawOutput = buildString {
-                        appendLine("TEKS YANG TERBACA")
-                        appendLine("====================")
-                        appendLine()
-                        appendLine(
-                            result.fullText.ifBlank {
-                                "Tidak ada teks yang dikenali."
-                            }
-                        )
-                        appendLine()
-                        appendLine("KOORDINAT TEKS")
-                        appendLine("====================")
-                        appendLine()
-
-                        if (result.lines.isEmpty()) {
-                            appendLine("Tidak ditemukan baris teks.")
-                        } else {
-                            result.lines.forEachIndexed { index, line ->
-                                appendLine("${index + 1}. ${line.text}")
-                                appendLine(
-                                    "   X: ${line.left}, Y: ${line.top}"
-                                )
-                                appendLine(
-                                    "   Lebar: ${line.right - line.left}, " +
-                                        "Tinggi: ${line.bottom - line.top}"
-                                )
-                                appendLine()
-                            }
-                        }
-                    }
+                    val orderOutput = buildOrderOutput(parsed)
+                    val detectionOutput = buildDetectionOutput(
+                        detection = detection,
+                        imageWidth = imageWidth,
+                        imageHeight = imageHeight
+                    )
+                    val rawOutput = buildRawOcrOutput(result)
 
                     orderResultText.text = orderOutput
+                    detectionResultText.text = detectionOutput
                     ocrResultText.text = rawOutput
 
                     statusText.text =
-                        "OCR selesai: ${result.lines.size} baris teks ditemukan. ${parsed.message}"
+                        "OCR selesai. ${parsed.message} ${detection.message}"
                 },
                 onFailure = { exception ->
-                    bitmap.recycle()
+                    if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+
                     isOcrRunning = false
 
                     if (isFinishing || isDestroyed) {
@@ -577,6 +557,8 @@ class MainActivity : Activity() {
                         "OCR gagal: ${exception.message}"
                     orderResultText.text =
                         "Pesanan belum dapat diproses karena OCR gagal."
+                    detectionResultText.text =
+                        "Deteksi lokasi belum dapat dilakukan."
                     ocrResultText.text =
                         "Terjadi kesalahan ketika membaca gambar."
                 }
@@ -585,16 +567,264 @@ class MainActivity : Activity() {
             if (!bitmap.isRecycled) {
                 bitmap.recycle()
             }
+
             isOcrRunning = false
             statusText.text = "Kesalahan OCR: ${e.message}"
             orderResultText.text =
                 "Pesanan belum dapat diproses karena terjadi kesalahan."
+            detectionResultText.text =
+                "Deteksi lokasi belum dapat dilakukan."
         }
+    }
+
+    private fun buildOrderOutput(
+        parsed: com.warung.autobag.ocr.OrderParseResult
+    ): String {
+        return buildString {
+            appendLine("STATUS: ${parsed.message}")
+            appendLine()
+
+            if (!parsed.headerFound) {
+                appendLine("Papan pesanan belum ditemukan pada gambar.")
+                appendLine("Pastikan tulisan PESANAN terlihat jelas.")
+            } else if (parsed.items.isEmpty()) {
+                appendLine(
+                    "Header PESANAN ditemukan, tetapi item belum dapat dipisahkan."
+                )
+                appendLine("Periksa diagnostik OCR di bagian bawah.")
+            } else {
+                appendLine("DAFTAR PESANAN PELANGGAN")
+                appendLine("========================")
+
+                parsed.items.forEachIndexed { index, item ->
+                    val current = item.currentQuantity?.toString() ?: "?"
+                    val required = item.requiredQuantity?.toString() ?: "?"
+
+                    appendLine("${index + 1}. ${item.name}")
+                    appendLine("   Jumlah: $current / $required")
+
+                    if (
+                        item.currentQuantity != null &&
+                        item.requiredQuantity != null
+                    ) {
+                        val remaining = (
+                            item.requiredQuantity -
+                                item.currentQuantity
+                            ).coerceAtLeast(0)
+
+                        appendLine("   Belum terpenuhi: $remaining")
+                    } else {
+                        appendLine(
+                            "   Belum dapat menghitung sisa pesanan."
+                        )
+                    }
+
+                    appendLine()
+                }
+
+                appendLine("Catatan: hasil ini masih perlu diverifikasi.")
+                appendLine(
+                    "Belum ada gesture mengambil atau memasukkan barang."
+                )
+            }
+        }
+    }
+
+    private fun buildDetectionOutput(
+        detection: SmartDetectionResult,
+        imageWidth: Int,
+        imageHeight: Int
+    ): String {
+        return buildString {
+            appendLine("STATUS: ${detection.message}")
+            appendLine("Ukuran gambar: ${imageWidth} x ${imageHeight}")
+            appendLine()
+
+            if (detection.detections.isNotEmpty()) {
+                appendLine("LOKASI BARANG YANG DIPERKIRAKAN")
+                appendLine("==============================")
+
+                detection.detections.forEachIndexed { index, item ->
+                    appendLine("${index + 1}. ${item.itemName}")
+
+                    val required = item.requestedQuantity?.toString() ?: "?"
+                    val current = item.currentQuantity?.toString() ?: "?"
+                    val remaining = item.remainingQuantity?.toString() ?: "?"
+
+                    appendLine("   Kebutuhan: $current / $required")
+                    appendLine("   Sisa: $remaining unit")
+                    appendLine(
+                        "   Titik target: X=${item.targetX.toInt()}, Y=${item.targetY.toInt()}"
+                    )
+                    appendLine("   Area rak: ${item.shelfRegion}")
+                    appendLine("   Label OCR: ${item.labelText}")
+                    appendLine()
+                }
+            }
+
+            if (detection.notFoundItems.isNotEmpty()) {
+                appendLine("BARANG YANG BELUM DITEMUKAN")
+                detection.notFoundItems.forEach {
+                    appendLine("- $it")
+                }
+                appendLine()
+            }
+
+            appendLine("CATATAN VALIDASI")
+            appendLine(
+                "Titik target merupakan estimasi dari posisi label OCR, bukan hasil deteksi objek visual."
+            )
+            appendLine(
+                "Periksa lingkaran hijau pada preview. Jangan gunakan koordinat ini untuk gesture otomatis sebelum divalidasi."
+            )
+        }
+    }
+
+    private fun buildRawOcrOutput(
+        result: com.warung.autobag.ocr.OcrResult
+    ): String {
+        return buildString {
+            appendLine("TEKS YANG TERBACA")
+            appendLine("====================")
+            appendLine()
+            appendLine(
+                result.fullText.ifBlank {
+                    "Tidak ada teks yang dikenali."
+                }
+            )
+            appendLine()
+            appendLine("KOORDINAT TEKS")
+            appendLine("====================")
+            appendLine()
+
+            if (result.lines.isEmpty()) {
+                appendLine("Tidak ditemukan baris teks.")
+            } else {
+                result.lines.forEachIndexed { index, line ->
+                    appendLine("${index + 1}. ${line.text}")
+                    appendLine("   X: ${line.left}, Y: ${line.top}")
+                    appendLine(
+                        "   Lebar: ${line.right - line.left}, " +
+                            "Tinggi: ${line.bottom - line.top}"
+                    )
+                    appendLine()
+                }
+            }
+        }
+    }
+
+    /**
+     * Menggambar lingkaran hijau pada estimasi titik produk.
+     * Gambar asli tidak diubah karena yang dipakai adalah salinannya.
+     */
+    private fun createDetectionOverlay(
+        source: Bitmap,
+        detection: SmartDetectionResult
+    ): Bitmap? {
+
+        // Tetap tampilkan capture terbaru walaupun belum ada barang cocok.
+        val output = source.copy(Bitmap.Config.ARGB_8888, true)
+            ?: return null
+
+        if (detection.detections.isEmpty()) {
+            return output
+        }
+
+        val canvas = Canvas(output)
+        val scale = output.width / REFERENCE_IMAGE_WIDTH
+
+        val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(0, 220, 90)
+            style = Paint.Style.STROKE
+            strokeWidth = 6f * scale
+        }
+
+        val crossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.YELLOW
+            style = Paint.Style.STROKE
+            strokeWidth = 4f * scale
+        }
+
+        val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(210, 0, 0, 0)
+            style = Paint.Style.FILL
+        }
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 25f * scale
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+
+        detection.detections.forEach { item ->
+            val x = item.targetX
+            val y = item.targetY
+            val radius = 38f * scale
+
+            canvas.drawCircle(x, y, radius, markerPaint)
+            canvas.drawLine(
+                x - radius,
+                y,
+                x + radius,
+                y,
+                crossPaint
+            )
+            canvas.drawLine(
+                x,
+                y - radius,
+                x,
+                y + radius,
+                crossPaint
+            )
+
+            val quantity = item.remainingQuantity?.toString() ?: "?"
+            val label = "${item.itemName} x$quantity"
+
+            val padding = 10f * scale
+            val textWidth = textPaint.measureText(label)
+            val boxHeight = 38f * scale
+
+            val boxLeft = (x - textWidth / 2f - padding)
+                .coerceAtLeast(0f)
+            val boxTop = (y - radius - boxHeight - 8f * scale)
+                .coerceAtLeast(0f)
+            val boxRight = (boxLeft + textWidth + padding * 2f)
+                .coerceAtMost(output.width.toFloat())
+            val boxBottom = (boxTop + boxHeight)
+                .coerceAtMost(output.height.toFloat())
+
+            canvas.drawRoundRect(
+                RectF(boxLeft, boxTop, boxRight, boxBottom),
+                8f * scale,
+                8f * scale,
+                backgroundPaint
+            )
+
+            canvas.drawText(
+                label,
+                boxLeft + padding,
+                boxBottom - 10f * scale,
+                textPaint
+            )
+        }
+
+        return output
     }
 
     override fun onDestroy() {
         textRecognizer?.close()
         textRecognizer = null
+
+        if (::previewImage.isInitialized) {
+            previewImage.setImageDrawable(null)
+        }
+        displayedBitmap?.let {
+            if (!it.isRecycled) {
+                it.recycle()
+            }
+        }
+        displayedBitmap = null
+
         super.onDestroy()
     }
 
@@ -612,6 +842,6 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int {
         return (
             value * resources.displayMetrics.density
-        ).toInt()
+            ).toInt()
     }
 }
