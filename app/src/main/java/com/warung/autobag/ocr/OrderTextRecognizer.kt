@@ -1,14 +1,15 @@
+
 package com.warung.autobag.ocr
 
 import android.graphics.Bitmap
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 
 /**
- * Satu elemen/kata yang dikenali OCR beserta koordinat aslinya.
- *
- * Koordinat menggunakan sistem koordinat Bitmap sumber.
+ * Satu elemen teks hasil OCR.
+ * Menyimpan teks dan koordinat asli setiap elemen.
  */
 data class RecognizedElement(
     val text: String,
@@ -20,9 +21,7 @@ data class RecognizedElement(
 
 /**
  * Satu baris teks hasil OCR.
- *
- * Properti elements memiliki nilai default agar pemanggilan lama
- * yang hanya mengirim lima parameter tetap kompatibel.
+ * Menyimpan teks lengkap dan seluruh elemen di dalamnya.
  */
 data class RecognizedLine(
     val text: String,
@@ -35,9 +34,6 @@ data class RecognizedLine(
 
 /**
  * Hasil keseluruhan proses OCR.
- *
- * Struktur OcrResult dipertahankan agar pemanggilan lama
- * OcrResult(fullText, lines) tetap kompatibel.
  */
 data class OcrResult(
     val fullText: String,
@@ -46,11 +42,6 @@ data class OcrResult(
 
 /**
  * Mesin OCR lokal menggunakan Google ML Kit.
- *
- * Selain teks per baris, recognizer sekarang menyimpan koordinat
- * setiap Text.Element agar parser dapat membedakan teks dari
- * kolom kiri dan kanan meskipun ML Kit menggabungkannya dalam
- * satu baris OCR.
  */
 class OrderTextRecognizer {
 
@@ -60,13 +51,14 @@ class OrderTextRecognizer {
         )
 
     /**
-     * Membaca teks dari Bitmap.
+     * Membaca teks dan koordinat setiap elemen dari Bitmap.
      */
     fun recognize(
         bitmap: Bitmap,
         onSuccess: (OcrResult) -> Unit,
         onFailure: (Exception) -> Unit
     ) {
+
         if (bitmap.isRecycled) {
             onFailure(
                 IllegalArgumentException(
@@ -76,25 +68,31 @@ class OrderTextRecognizer {
             return
         }
 
-        val image = InputImage.fromBitmap(bitmap, 0)
+        val image = InputImage.fromBitmap(
+            bitmap,
+            0
+        )
 
         recognizer.process(image)
+
             .addOnSuccessListener { visionText ->
 
                 val recognizedLines =
                     visionText.textBlocks.flatMap { block ->
 
-                        block.lines.mapNotNull { line ->
+                        block.lines.mapNotNull lineLoop@{ line ->
 
-                            val lineBounds = line.boundingBox
-                                ?: return@mapNotNull null
+                            val bounds = line.boundingBox
+                                ?: return@lineLoop null
 
+                            // Ambil setiap elemen teks
+                            // beserta koordinat aslinya.
                             val recognizedElements =
-                                line.elements.mapNotNull { element ->
+                                line.elements.mapNotNull elementLoop@{ element ->
 
                                     val elementBounds =
                                         element.boundingBox
-                                            ?: return@mapNotNull null
+                                            ?: return@elementLoop null
 
                                     RecognizedElement(
                                         text = element.text,
@@ -107,23 +105,25 @@ class OrderTextRecognizer {
 
                             RecognizedLine(
                                 text = line.text,
-                                left = lineBounds.left,
-                                top = lineBounds.top,
-                                right = lineBounds.right,
-                                bottom = lineBounds.bottom,
+                                left = bounds.left,
+                                top = bounds.top,
+                                right = bounds.right,
+                                bottom = bounds.bottom,
                                 elements = recognizedElements
                             )
                         }
                     }
 
-                onSuccess(
-                    OcrResult(
-                        fullText = visionText.text,
-                        lines = recognizedLines
-                    )
+                val result = OcrResult(
+                    fullText = visionText.text,
+                    lines = recognizedLines
                 )
+
+                onSuccess(result)
             }
+
             .addOnFailureListener { exception ->
+
                 onFailure(exception)
             }
     }
