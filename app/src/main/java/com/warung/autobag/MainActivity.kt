@@ -101,7 +101,7 @@ class MainActivity : Activity() {
         val previewHeading = createHeading("PREVIEW HASIL TANGKAPAN")
 
         previewImage = ImageView(this).apply {
-            setBackgroundColor(Color.rgb(225, 230, 225))
+            setBackgroundColor(Color.rgb(28, 36, 31))
             scaleType = ImageView.ScaleType.FIT_CENTER
             adjustViewBounds = true
             contentDescription = "Hasil tangkapan layar dengan penanda lokasi barang"
@@ -135,10 +135,12 @@ class MainActivity : Activity() {
 
         orderResultText = TextView(this).apply {
             text = "Belum ada hasil parsing pesanan."
-            textSize = 15f
+            textSize = 16f
             setTextColor(Color.rgb(30, 65, 40))
             setBackgroundColor(Color.WHITE)
-            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setLineSpacing(dp(3).toFloat(), 1.08f)
+            includeFontPadding = true
             setTextIsSelectable(true)
         }
 
@@ -146,10 +148,12 @@ class MainActivity : Activity() {
 
         detectionResultText = TextView(this).apply {
             text = "Belum ada hasil deteksi lokasi barang."
-            textSize = 14f
+            textSize = 16f
             setTextColor(Color.rgb(25, 65, 38))
             setBackgroundColor(Color.WHITE)
-            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setLineSpacing(dp(4).toFloat(), 1.08f)
+            includeFontPadding = true
             setTextIsSelectable(true)
         }
 
@@ -203,7 +207,7 @@ class MainActivity : Activity() {
             previewImage,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(350)
+                dp(180)
             ).apply {
                 bottomMargin = dp(22)
             }
@@ -636,14 +640,15 @@ class MainActivity : Activity() {
         imageHeight: Int
     ): String {
         return buildString {
-            appendLine("STATUS: ${detection.message}")
+            appendLine("STATUS DETEKSI")
+            appendLine(detection.message)
             appendLine("Ukuran gambar: ${imageWidth} x ${imageHeight}")
             appendLine()
 
-            if (detection.detections.isNotEmpty()) {
-                appendLine("LOKASI BARANG YANG DIPERKIRAKAN")
-                appendLine("==============================")
+            appendLine("LOKASI BARANG DITEMUKAN: ${detection.detections.size}")
+            appendLine("==============================")
 
+            if (detection.detections.isNotEmpty()) {
                 detection.detections.forEachIndexed { index, item ->
                     appendLine("${index + 1}. ${item.itemName}")
 
@@ -651,31 +656,35 @@ class MainActivity : Activity() {
                     val current = item.currentQuantity?.toString() ?: "?"
                     val remaining = item.remainingQuantity?.toString() ?: "?"
 
-                    appendLine("   Kebutuhan: $current / $required")
-                    appendLine("   Sisa: $remaining unit")
+                    appendLine("   Jumlah pesanan: $current / $required")
+                    appendLine("   Belum terpenuhi: $remaining")
                     appendLine(
-                        "   Titik target: X=${item.targetX.toInt()}, Y=${item.targetY.toInt()}"
+                        "   Perkiraan titik: X=${item.targetX.toInt()}, Y=${item.targetY.toInt()}"
                     )
-                    appendLine("   Area rak: ${item.shelfRegion}")
-                    appendLine("   Label OCR: ${item.labelText}")
+                    appendLine("   Area: ${item.shelfRegion}")
+                    appendLine("   Label terbaca: ${item.labelText}")
                     appendLine()
                 }
+            } else {
+                appendLine("Belum ada label barang yang cocok dengan katalog.")
+                appendLine()
             }
 
             if (detection.notFoundItems.isNotEmpty()) {
-                appendLine("BARANG YANG BELUM DITEMUKAN")
-                detection.notFoundItems.forEach {
-                    appendLine("- $it")
+                appendLine("BARANG YANG BELUM DITEMUKAN: ${detection.notFoundItems.size}")
+                appendLine("==============================")
+                detection.notFoundItems.forEach { itemName ->
+                    appendLine("- $itemName")
                 }
                 appendLine()
             }
 
             appendLine("CATATAN VALIDASI")
             appendLine(
-                "Titik target merupakan estimasi dari posisi label OCR, bukan hasil deteksi objek visual."
+                "Lingkaran hijau menandai perkiraan posisi gambar produk berdasarkan label OCR."
             )
             appendLine(
-                "Periksa lingkaran hijau pada preview. Jangan gunakan koordinat ini untuk gesture otomatis sebelum divalidasi."
+                "Periksa setiap lingkaran pada preview. Koordinat belum boleh digunakan untuk gesture otomatis sebelum divalidasi."
             )
         }
     }
@@ -733,77 +742,106 @@ class MainActivity : Activity() {
         val canvas = Canvas(output)
         val scale = output.width / REFERENCE_IMAGE_WIDTH
 
+        // Ukuran penanda diperbesar agar tetap terlihat setelah gambar
+        // landscape diperkecil ke lebar layar ponsel.
+        val markerRadius = 66f * scale
+
+        val markerFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(75, 0, 220, 90)
+            style = Paint.Style.FILL
+        }
+
         val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(0, 220, 90)
+            color = Color.rgb(0, 235, 100)
             style = Paint.Style.STROKE
-            strokeWidth = 6f * scale
+            strokeWidth = 16f * scale
         }
 
         val crossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.YELLOW
             style = Paint.Style.STROKE
-            strokeWidth = 4f * scale
+            strokeWidth = 8f * scale
         }
 
         val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(210, 0, 0, 0)
+            color = Color.argb(225, 0, 0, 0)
             style = Paint.Style.FILL
         }
 
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
-            textSize = 25f * scale
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            textSize = 88f * scale
+            typeface = android.graphics.Typeface.create(
+                android.graphics.Typeface.DEFAULT,
+                android.graphics.Typeface.BOLD
+            )
         }
 
-        detection.detections.forEach { item ->
-            val x = item.targetX
-            val y = item.targetY
-            val radius = 38f * scale
+        detection.detections.forEachIndexed { index, item ->
+            val x = item.targetX.coerceIn(0f, output.width.toFloat())
+            val y = item.targetY.coerceIn(0f, output.height.toFloat())
+            val radius = markerRadius
 
+            // Lingkaran transparan, garis tepi, dan tanda silang.
+            canvas.drawCircle(x, y, radius, markerFillPaint)
             canvas.drawCircle(x, y, radius, markerPaint)
-            canvas.drawLine(
-                x - radius,
-                y,
-                x + radius,
-                y,
-                crossPaint
-            )
-            canvas.drawLine(
-                x,
-                y - radius,
-                x,
-                y + radius,
-                crossPaint
-            )
+            canvas.drawLine(x - radius, y, x + radius, y, crossPaint)
+            canvas.drawLine(x, y - radius, x, y + radius, crossPaint)
 
-            val quantity = item.remainingQuantity?.toString() ?: "?"
-            val label = "${item.itemName} x$quantity"
+            val remaining = item.remainingQuantity?.toString() ?: "?"
+            val label = "${index + 1}. ${item.itemName} (sisa $remaining)"
 
-            val padding = 10f * scale
+            val padding = 22f * scale
+            val maxLabelWidth = (output.width - 24f * scale).coerceAtLeast(1f)
+
+            // Turunkan ukuran teks hanya jika label sangat panjang.
+            val baseTextSize = 88f * scale
+            textPaint.textSize = baseTextSize
+            val measuredTextWidth = textPaint.measureText(label)
+            if (measuredTextWidth + padding * 2f > maxLabelWidth) {
+                val adjustedSize = baseTextSize *
+                    (maxLabelWidth / (measuredTextWidth + padding * 2f))
+                textPaint.textSize = adjustedSize.coerceAtLeast(48f * scale)
+            }
+
             val textWidth = textPaint.measureText(label)
-            val boxHeight = 38f * scale
+            val labelWidth = (textWidth + padding * 2f)
+                .coerceAtMost(maxLabelWidth)
+            val fontMetrics = textPaint.fontMetrics
+            val textHeight = fontMetrics.descent - fontMetrics.ascent
+            val labelHeight = maxOf(112f * scale, textHeight + padding)
 
-            val boxLeft = (x - textWidth / 2f - padding)
-                .coerceAtLeast(0f)
-            val boxTop = (y - radius - boxHeight - 8f * scale)
-                .coerceAtLeast(0f)
-            val boxRight = (boxLeft + textWidth + padding * 2f)
-                .coerceAtMost(output.width.toFloat())
-            val boxBottom = (boxTop + boxHeight)
-                .coerceAtMost(output.height.toFloat())
+            val labelLeft = (x - labelWidth / 2f)
+                .coerceIn(12f * scale, output.width - labelWidth - 12f * scale)
+
+            val aboveTop = y - radius - labelHeight - 14f * scale
+            val belowTop = y + radius + 14f * scale
+            val preferredTop = if (aboveTop >= 8f * scale) {
+                aboveTop
+            } else {
+                belowTop
+            }
+            val labelTop = preferredTop.coerceIn(
+                8f * scale,
+                (output.height - labelHeight - 8f * scale).coerceAtLeast(8f * scale)
+            )
+            val labelRight = labelLeft + labelWidth
+            val labelBottom = labelTop + labelHeight
 
             canvas.drawRoundRect(
-                RectF(boxLeft, boxTop, boxRight, boxBottom),
-                8f * scale,
-                8f * scale,
+                RectF(labelLeft, labelTop, labelRight, labelBottom),
+                14f * scale,
+                14f * scale,
                 backgroundPaint
             )
 
+            val baseline = labelTop +
+                (labelHeight - textHeight) / 2f - fontMetrics.ascent
+
             canvas.drawText(
                 label,
-                boxLeft + padding,
-                boxBottom - 10f * scale,
+                labelLeft + padding,
+                baseline,
                 textPaint
             )
         }
