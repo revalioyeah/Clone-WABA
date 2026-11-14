@@ -1,4 +1,3 @@
-
 package com.warung.autobag
 
 import android.app.Activity
@@ -12,17 +11,15 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
-import android.view.View
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-
 import com.warung.autobag.capture.ScreenCaptureService
+import com.warung.autobag.ocr.OrderParser
 import com.warung.autobag.ocr.OrderTextRecognizer
-
 import java.io.File
 
 class MainActivity : Activity() {
@@ -33,6 +30,7 @@ class MainActivity : Activity() {
 
     private lateinit var statusText: TextView
     private lateinit var previewImage: ImageView
+    private lateinit var orderResultText: TextView
     private lateinit var ocrResultText: TextView
 
     private var textRecognizer: OrderTextRecognizer? = null
@@ -51,7 +49,6 @@ class MainActivity : Activity() {
             addView(page)
         }
 
-        // JUDUL APLIKASI
         val title = TextView(this).apply {
             text = "Warung Auto Bag Assistant"
             textSize = 25f
@@ -60,12 +57,11 @@ class MainActivity : Activity() {
         }
 
         val subtitle = TextView(this).apply {
-            text = "Screen Capture & Smart OCR\n\nAmbil gambar layar game dan baca teks pesanan secara otomatis."
+            text = "Screen Capture & Smart Order Recognition\n\nAmbil gambar layar game, baca papan pesanan, lalu pisahkan nama barang dan jumlahnya."
             textSize = 15f
             setTextColor(Color.DKGRAY)
         }
 
-        // STATUS
         val heading = createHeading("SCREEN CAPTURE CONTROL")
 
         statusText = TextView(this).apply {
@@ -74,41 +70,27 @@ class MainActivity : Activity() {
             setTextColor(Color.DKGRAY)
         }
 
-        // TOMBOL MULAI CAPTURE
         val startButton = Button(this).apply {
             text = "MULAI SCREEN CAPTURE"
-            setOnClickListener {
-                requestScreenCapture()
-            }
+            setOnClickListener { requestScreenCapture() }
         }
 
-        // TOMBOL HENTIKAN CAPTURE
         val stopButton = Button(this).apply {
             text = "HENTIKAN SCREEN CAPTURE"
-            setOnClickListener {
-                stopScreenCapture()
-            }
+            setOnClickListener { stopScreenCapture() }
         }
 
-        // TOMBOL PREVIEW
         val previewButton = Button(this).apply {
             text = "LIHAT HASIL TANGKAPAN"
-            setOnClickListener {
-                showLatestCapture()
-            }
+            setOnClickListener { showLatestCapture() }
         }
 
-        // TOMBOL SIMPAN KE GALERI
         val saveButton = Button(this).apply {
             text = "SIMPAN HASIL KE GALERI"
-            setOnClickListener {
-                saveLatestCaptureToGallery()
-            }
+            setOnClickListener { saveLatestCaptureToGallery() }
         }
 
-        val previewHeading = createHeading(
-            "PREVIEW HASIL TANGKAPAN"
-        )
+        val previewHeading = createHeading("PREVIEW HASIL TANGKAPAN")
 
         previewImage = ImageView(this).apply {
             setBackgroundColor(Color.rgb(225, 230, 225))
@@ -117,84 +99,84 @@ class MainActivity : Activity() {
             contentDescription = "Hasil tangkapan layar"
         }
 
-        // BAGIAN OCR
-        val ocrHeading = createHeading(
-            "SMART ORDER RECOGNITION"
-        )
+        val orderHeading = createHeading("SMART ORDER RECOGNITION")
 
-        val ocrDescription = TextView(this).apply {
-            text = "Baca teks dari gambar terakhir menggunakan Google ML Kit."
+        val orderDescription = TextView(this).apply {
+            text = "Tekan tombol di bawah untuk membaca teks pada gambar terakhir dan mencoba memisahkan daftar pesanan pelanggan."
             textSize = 14f
             setTextColor(Color.DKGRAY)
         }
 
         val ocrButton = Button(this).apply {
-            text = "BACA TEKS OCR"
-            setOnClickListener {
-                runOcr()
-            }
+            text = "BACA PESANAN & TEKS OCR"
+            setOnClickListener { runOcr() }
         }
 
         val clearButton = Button(this).apply {
-            text = "BERSIHKAN HASIL OCR"
+            text = "BERSIHKAN HASIL"
             setOnClickListener {
+                orderResultText.text = "Belum ada hasil parsing pesanan."
                 ocrResultText.text = "Belum ada hasil OCR."
-                statusText.text = "Hasil OCR telah dibersihkan."
+                statusText.text = "Hasil pembacaan telah dibersihkan."
             }
         }
 
-        val resultHeading = createHeading(
-            "HASIL PEMBACAAN OCR"
-        )
+        val parsedHeading = createHeading("HASIL PESANAN TERSTRUKTUR")
+
+        orderResultText = TextView(this).apply {
+            text = "Belum ada hasil parsing pesanan."
+            textSize = 15f
+            setTextColor(Color.rgb(30, 65, 40))
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setTextIsSelectable(true)
+        }
+
+        val rawHeading = createHeading("DIAGNOSTIK OCR")
 
         ocrResultText = TextView(this).apply {
             text = "Belum ada hasil OCR."
-            textSize = 14f
+            textSize = 13f
             setTextColor(Color.DKGRAY)
             setBackgroundColor(Color.WHITE)
             setPadding(dp(14), dp(14), dp(14), dp(14))
             setTextIsSelectable(true)
         }
 
-        // PETUNJUK PENGGUNAAN
         val instruction = TextView(this).apply {
             text = """
                 PETUNJUK PENGGUNAAN
 
                 1. Tekan MULAI SCREEN CAPTURE.
-                2. Setujui izin Android.
+                2. Setujui izin perekaman layar Android.
                 3. Pindah ke Warung Life Simulator.
-                4. Tunggu sampai pesanan pelanggan terlihat.
+                4. Tunggu sampai papan pesanan pelanggan terlihat.
                 5. Hentikan capture melalui notifikasi Android.
                 6. Kembali ke aplikasi.
                 7. Tekan LIHAT HASIL TANGKAPAN.
-                8. Tekan SIMPAN HASIL KE GALERI jika diperlukan.
-                9. Tekan BACA TEKS OCR.
+                8. Tekan BACA PESANAN & TEKS OCR.
+                9. Periksa hasil pesanan terstruktur dan diagnostik OCR.
 
-                Gambar disimpan secara lokal di perangkat.
-                Proses OCR dilakukan menggunakan Google ML Kit.
+                Catatan:
+                - OCR membaca gambar terakhir yang tersimpan oleh aplikasi.
+                - Parsing pesanan masih tahap pengujian.
+                - Belum ada barang yang diambil atau gesture otomatis yang dijalankan.
             """.trimIndent()
-
             textSize = 13f
             setTextColor(Color.DKGRAY)
         }
 
-        // MENYUSUN TAMPILAN
         page.addView(title, marginParams(8))
         page.addView(subtitle, marginParams(24))
 
         page.addView(heading, marginParams(12))
         page.addView(statusText, marginParams(12))
-
         page.addView(startButton, marginParams(8))
         page.addView(stopButton, marginParams(8))
         page.addView(previewButton, marginParams(8))
-
-        // Tombol baru untuk menyimpan gambar
         page.addView(saveButton, marginParams(22))
 
         page.addView(previewHeading, marginParams(10))
-
         page.addView(
             previewImage,
             LinearLayout.LayoutParams(
@@ -205,18 +187,19 @@ class MainActivity : Activity() {
             }
         )
 
-        page.addView(ocrHeading, marginParams(10))
-        page.addView(ocrDescription, marginParams(8))
+        page.addView(orderHeading, marginParams(10))
+        page.addView(orderDescription, marginParams(8))
         page.addView(ocrButton, marginParams(8))
         page.addView(clearButton, marginParams(8))
-        page.addView(resultHeading, marginParams(12))
+        page.addView(parsedHeading, marginParams(12))
+        page.addView(orderResultText, marginParams(18))
+        page.addView(rawHeading, marginParams(12))
         page.addView(ocrResultText, marginParams(18))
         page.addView(instruction, marginParams())
 
         setContentView(scrollView)
     }
 
-    // MEMBUAT JUDUL BAGIAN
     private fun createHeading(text: String): TextView {
         return TextView(this).apply {
             this.text = text
@@ -226,9 +209,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // MEMULAI PERMINTAAN SCREEN CAPTURE
     private fun requestScreenCapture() {
-
         val manager = getSystemService(
             Context.MEDIA_PROJECTION_SERVICE
         ) as MediaProjectionManager
@@ -239,28 +220,21 @@ class MainActivity : Activity() {
         )
     }
 
-    // MENERIMA HASIL PERSETUJUAN SCREEN CAPTURE
     @Deprecated("Using MediaProjection consent result")
     override fun onActivityResult(
         requestCode: Int,
         resultCode: Int,
         data: Intent?
     ) {
-        super.onActivityResult(
-            requestCode,
-            resultCode,
-            data
-        )
+        super.onActivityResult(requestCode, resultCode, data)
 
         if (requestCode != REQUEST_SCREEN_CAPTURE) return
 
         if (resultCode == RESULT_OK && data != null) {
-
             val oldCapture = File(
                 filesDir,
                 ScreenCaptureService.CAPTURE_FILE_NAME
             )
-
             oldCapture.delete()
 
             val serviceIntent = Intent(
@@ -271,7 +245,6 @@ class MainActivity : Activity() {
                     ScreenCaptureService.EXTRA_RESULT_CODE,
                     resultCode
                 )
-
                 putExtra(
                     ScreenCaptureService.EXTRA_RESULT_DATA,
                     data
@@ -280,24 +253,16 @@ class MainActivity : Activity() {
 
             try {
                 startForegroundService(serviceIntent)
-
-                statusText.text =
-                    "Screen Capture sedang dimulai."
-
+                statusText.text = "Screen Capture sedang dimulai."
             } catch (e: Exception) {
-                statusText.text =
-                    "Gagal memulai capture: ${e.message}"
+                statusText.text = "Gagal memulai capture: ${e.message}"
             }
-
         } else {
-            statusText.text =
-                "Izin Screen Capture ditolak."
+            statusText.text = "Izin Screen Capture ditolak."
         }
     }
 
-    // MENGHENTIKAN SCREEN CAPTURE
     private fun stopScreenCapture() {
-
         val serviceIntent = Intent(
             this,
             ScreenCaptureService::class.java
@@ -312,45 +277,35 @@ class MainActivity : Activity() {
         }
     }
 
-    // MENAMPILKAN GAMBAR TERAKHIR
     private fun showLatestCapture() {
-
         val imageFile = File(
             filesDir,
             ScreenCaptureService.CAPTURE_FILE_NAME
         )
 
         if (!imageFile.exists()) {
-            statusText.text =
-                "Belum ada gambar tangkapan."
+            statusText.text = "Belum ada gambar tangkapan."
             return
         }
 
-        val bitmap = BitmapFactory.decodeFile(
-            imageFile.absolutePath
-        )
+        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
 
         if (bitmap == null) {
-            statusText.text =
-                "Gambar tidak dapat dibaca."
+            statusText.text = "Gambar tidak dapat dibaca."
             return
         }
 
         previewImage.setImageBitmap(bitmap)
-
         statusText.text =
             "Gambar berhasil dibaca: ${bitmap.width} x ${bitmap.height}"
     }
 
-    // FITUR BARU: SIMPAN GAMBAR KE GALERI
     private fun saveLatestCaptureToGallery() {
-
         val imageFile = File(
             filesDir,
             ScreenCaptureService.CAPTURE_FILE_NAME
         )
 
-        // Memeriksa keberadaan gambar
         if (!imageFile.exists()) {
             Toast.makeText(
                 this,
@@ -360,7 +315,6 @@ class MainActivity : Activity() {
             return
         }
 
-        // MediaStore untuk Android 10 ke atas
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             Toast.makeText(
                 this,
@@ -370,10 +324,7 @@ class MainActivity : Activity() {
             return
         }
 
-        // Membaca gambar asli
-        val bitmap = BitmapFactory.decodeFile(
-            imageFile.absolutePath
-        )
+        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
 
         if (bitmap == null) {
             Toast.makeText(
@@ -387,49 +338,33 @@ class MainActivity : Activity() {
         var imageUri: android.net.Uri? = null
 
         try {
-
-            // Menentukan nama dan lokasi file
             val values = ContentValues().apply {
-
                 put(
                     MediaStore.MediaColumns.DISPLAY_NAME,
                     "WarungCapture_${System.currentTimeMillis()}.jpg"
                 )
-
                 put(
                     MediaStore.MediaColumns.MIME_TYPE,
                     "image/jpeg"
                 )
-
                 put(
                     MediaStore.MediaColumns.RELATIVE_PATH,
                     "Pictures/WarungAutoBag"
                 )
-
-                put(
-                    MediaStore.MediaColumns.IS_PENDING,
-                    1
-                )
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
 
-            // Membuat file baru di Galeri
             imageUri = contentResolver.insert(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                 values
-            ) ?: throw Exception(
-                "Gagal membuat file di Galeri."
-            )
+            ) ?: throw Exception("Gagal membuat file di Galeri.")
 
-            // Menulis gambar dalam format JPEG
             val outputStream = contentResolver.openOutputStream(
                 imageUri,
                 "w"
-            ) ?: throw Exception(
-                "Tidak dapat membuka file tujuan."
-            )
+            ) ?: throw Exception("Tidak dapat membuka file tujuan.")
 
             val compressed = outputStream.use { output ->
-
                 bitmap.compress(
                     Bitmap.CompressFormat.JPEG,
                     95,
@@ -438,17 +373,11 @@ class MainActivity : Activity() {
             }
 
             if (!compressed) {
-                throw Exception(
-                    "Gagal mengubah gambar menjadi JPEG."
-                )
+                throw Exception("Gagal mengubah gambar menjadi JPEG.")
             }
 
-            // Menyelesaikan proses penyimpanan
             val completedValues = ContentValues().apply {
-                put(
-                    MediaStore.MediaColumns.IS_PENDING,
-                    0
-                )
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
             }
 
             val updated = contentResolver.update(
@@ -459,9 +388,7 @@ class MainActivity : Activity() {
             )
 
             if (updated <= 0) {
-                throw Exception(
-                    "Gagal menyelesaikan penyimpanan gambar."
-                )
+                throw Exception("Gagal menyelesaikan penyimpanan gambar.")
             }
 
             Toast.makeText(
@@ -472,10 +399,7 @@ class MainActivity : Activity() {
 
             statusText.text =
                 "Gambar tersimpan di Pictures/WarungAutoBag."
-
         } catch (e: Exception) {
-
-            // Menghapus file jika proses gagal
             imageUri?.let {
                 contentResolver.delete(it, null, null)
             }
@@ -486,20 +410,15 @@ class MainActivity : Activity() {
                 Toast.LENGTH_LONG
             ).show()
 
-            statusText.text =
-                "Penyimpanan gagal: ${e.message}"
-
+            statusText.text = "Penyimpanan gagal: ${e.message}"
         } finally {
             bitmap.recycle()
         }
     }
 
-    // MENJALANKAN OCR
     private fun runOcr() {
-
         if (isOcrRunning) {
-            statusText.text =
-                "OCR masih sedang berjalan."
+            statusText.text = "OCR masih sedang berjalan."
             return
         }
 
@@ -514,37 +433,25 @@ class MainActivity : Activity() {
             return
         }
 
-        val bitmap = BitmapFactory.decodeFile(
-            imageFile.absolutePath
-        )
+        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
 
         if (bitmap == null) {
-            statusText.text =
-                "Gambar tidak dapat dibuka untuk OCR."
+            statusText.text = "Gambar tidak dapat dibuka untuk OCR."
             return
         }
 
         isOcrRunning = true
-
-        statusText.text =
-            "Sedang membaca teks menggunakan ML Kit..."
-
-        ocrResultText.text =
-            "Proses OCR sedang berjalan..."
+        statusText.text = "Sedang membaca teks dan memproses pesanan..."
+        orderResultText.text = "Proses pembacaan pesanan sedang berjalan..."
+        ocrResultText.text = "Proses OCR sedang berjalan..."
 
         val recognizer = textRecognizer
-            ?: OrderTextRecognizer().also {
-                textRecognizer = it
-            }
+            ?: OrderTextRecognizer().also { textRecognizer = it }
 
         try {
-
             recognizer.recognize(
-
                 bitmap = bitmap,
-
                 onSuccess = { result ->
-
                     bitmap.recycle()
                     isOcrRunning = false
 
@@ -552,59 +459,113 @@ class MainActivity : Activity() {
                         return@recognize
                     }
 
-                    val output = buildString {
+                    // Jalankan parser pada hasil OCR yang sama.
+                    val parsed = OrderParser.parse(result)
 
+                    val orderOutput = buildString {
+                        appendLine("STATUS: ${parsed.message}")
+                        appendLine()
+
+                        if (!parsed.headerFound) {
+                            appendLine(
+                                "Papan pesanan belum ditemukan pada gambar."
+                            )
+                            appendLine(
+                                "Pastikan tulisan PESANAN terlihat jelas."
+                            )
+                        } else if (parsed.items.isEmpty()) {
+                            appendLine(
+                                "Header PESANAN ditemukan, tetapi item belum dapat dipisahkan."
+                            )
+                            appendLine(
+                                "Periksa diagnostik OCR di bagian bawah."
+                            )
+                        } else {
+                            appendLine("DAFTAR PESANAN PELANGGAN")
+                            appendLine("========================")
+
+                            parsed.items.forEachIndexed { index, item ->
+                                val current = item.currentQuantity
+                                    ?.toString() ?: "?"
+
+                                val required = item.requiredQuantity
+                                    ?.toString() ?: "?"
+
+                                appendLine(
+                                    "${index + 1}. ${item.name}"
+                                )
+                                appendLine(
+                                    "   Jumlah: $current / $required"
+                                )
+
+                                if (
+                                    item.currentQuantity != null &&
+                                    item.requiredQuantity != null
+                                ) {
+                                    val remaining = (
+                                        item.requiredQuantity -
+                                            item.currentQuantity
+                                    ).coerceAtLeast(0)
+
+                                    appendLine(
+                                        "   Belum terpenuhi: $remaining"
+                                    )
+                                } else {
+                                    appendLine(
+                                        "   Belum dapat menghitung sisa pesanan."
+                                    )
+                                }
+
+                                appendLine()
+                            }
+
+                            appendLine(
+                                "Catatan: hasil ini masih perlu diverifikasi."
+                            )
+                            appendLine(
+                                "Belum ada gesture mengambil atau memasukkan barang."
+                            )
+                        }
+                    }
+
+                    val rawOutput = buildString {
                         appendLine("TEKS YANG TERBACA")
                         appendLine("====================")
                         appendLine()
-
                         appendLine(
                             result.fullText.ifBlank {
                                 "Tidak ada teks yang dikenali."
                             }
                         )
-
                         appendLine()
                         appendLine("KOORDINAT TEKS")
                         appendLine("====================")
                         appendLine()
 
                         if (result.lines.isEmpty()) {
-
-                            appendLine(
-                                "Tidak ditemukan baris teks."
-                            )
-
+                            appendLine("Tidak ditemukan baris teks.")
                         } else {
-
-                            result.lines.forEachIndexed {
-                                index, line ->
-
-                                appendLine(
-                                    "${index + 1}. ${line.text}"
-                                )
-
+                            result.lines.forEachIndexed { index, line ->
+                                appendLine("${index + 1}. ${line.text}")
                                 appendLine(
                                     "   X: ${line.left}, Y: ${line.top}"
                                 )
-
                                 appendLine(
-                                    "   Lebar: ${line.right - line.left}, Tinggi: ${line.bottom - line.top}"
+                                    "   Lebar: ${line.right - line.left}, " +
+                                        "Tinggi: ${line.bottom - line.top}"
                                 )
-
                                 appendLine()
                             }
                         }
                     }
 
-                    ocrResultText.text = output
+                    orderResultText.text = orderOutput
+                    ocrResultText.text = rawOutput
 
                     statusText.text =
-                        "OCR selesai: ${result.lines.size} baris teks ditemukan."
+                        "OCR selesai: ${result.lines.size} baris teks ditemukan. ${parsed.message}"
                 },
-
                 onFailure = { exception ->
-
                     bitmap.recycle()
                     isOcrRunning = false
 
@@ -614,34 +575,32 @@ class MainActivity : Activity() {
 
                     statusText.text =
                         "OCR gagal: ${exception.message}"
-
+                    orderResultText.text =
+                        "Pesanan belum dapat diproses karena OCR gagal."
                     ocrResultText.text =
                         "Terjadi kesalahan ketika membaca gambar."
                 }
             )
-
         } catch (e: Exception) {
-
-            bitmap.recycle()
+            if (!bitmap.isRecycled) {
+                bitmap.recycle()
+            }
             isOcrRunning = false
-
-            statusText.text =
-                "Kesalahan OCR: ${e.message}"
+            statusText.text = "Kesalahan OCR: ${e.message}"
+            orderResultText.text =
+                "Pesanan belum dapat diproses karena terjadi kesalahan."
         }
     }
 
-    // MEMBERSIHKAN RESOURCE OCR
     override fun onDestroy() {
         textRecognizer?.close()
         textRecognizer = null
         super.onDestroy()
     }
 
-    // PENGATURAN JARAK TAMPILAN
     private fun marginParams(
         bottom: Int = 0
     ): LinearLayout.LayoutParams {
-
         return LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
@@ -650,7 +609,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // KONVERSI DP
     private fun dp(value: Int): Int {
         return (
             value * resources.displayMetrics.density
