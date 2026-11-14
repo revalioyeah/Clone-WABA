@@ -10,6 +10,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -34,6 +35,7 @@ import com.warung.autobag.gesture.TargetGameConfig
 import com.warung.autobag.ocr.OrderParser
 import com.warung.autobag.ocr.OrderParseResult
 import com.warung.autobag.ocr.OrderTextRecognizer
+import com.warung.autobag.ocr.OcrResult
 import java.io.File
 
 class MainActivity : Activity() {
@@ -41,6 +43,9 @@ class MainActivity : Activity() {
     companion object {
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REFERENCE_IMAGE_WIDTH = 2304f
+        private const val MAX_VERIFICATION_ATTEMPTS = 3
+        private const val FIRST_VERIFICATION_DELAY_MS = 250L
+        private const val GAME_SWITCH_DELAY_MS = 1_500L
     }
 
     private lateinit var statusText: TextView
@@ -63,6 +68,7 @@ class MainActivity : Activity() {
     private var latestImageWidth = 0
     private var latestImageHeight = 0
     private var latestCaptureModifiedAtOcr = 0L
+    private var verificationRegion: Rect? = null
     private var pendingVerification: PendingVerification? = null
     private var pendingStartRunnable: Runnable? = null
 
@@ -211,12 +217,13 @@ class MainActivity : Activity() {
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
                 pendingStartRunnable = null
                 pendingVerification = null
+                ScreenCaptureService.setAutomationActive(false)
                 executionManager?.stop()
             }
         }
 
         val automationNote = TextView(this).apply {
-            text = "Capture harus tetap aktif selama otomatisasi agar setiap drag dapat diverifikasi dengan OCR. Setelah menekan MULAI, pindah kembali ke game dalam 3 detik. Jika panel pesanan tidak terbaca atau muncul interupsi, antrean akan dijeda tanpa mengulang drag secara buta."
+            text = "Capture harus tetap aktif selama otomatisasi agar setiap drag dapat diverifikasi dengan OCR. Setelah menekan MULAI, pindah kembali ke game dalam 1,5 detik. Jika panel pesanan tidak terbaca atau muncul interupsi, antrean akan dijeda tanpa mengulang drag secara buta."
             textSize = 12f
             setTextColor(Color.DKGRAY)
         }
@@ -272,7 +279,7 @@ class MainActivity : Activity() {
                 8. Periksa daftar pesanan dan penanda hijau pada preview.
                 9. Cocokkan penanda hijau dengan gambar barang dan penanda biru dengan kantong plastik.
                 10. Centang konfirmasi kalibrasi, lalu tekan UJI GESTURE — 1 BARANG.
-                11. Pindah ke game dalam 3 detik dan amati hasilnya.
+                11. Pindah ke game dalam 1,5 detik dan amati hasilnya.
 
                 CATATAN PENTING:
                 - Titik hijau masih merupakan estimasi posisi produk.
@@ -353,6 +360,10 @@ class MainActivity : Activity() {
             },
             listener = object : OrderExecutionManager.Listener {
                 override fun onStateChanged(snapshot: OrderExecutionManager.Snapshot) {
+                    ScreenCaptureService.setAutomationActive(
+                        snapshot.state == OrderExecutionManager.State.RUNNING ||
+                            snapshot.state == OrderExecutionManager.State.WAITING_VERIFICATION
+                    )
                     runOnUiThread {
                         if (!isFinishing && !isDestroyed && ::executionStatusText.isInitialized) {
                             executionStatusText.text = buildString {
@@ -483,7 +494,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Konfirmasi $mode")
             .setMessage(
-                "$description\n\nKoordinat barang dan kantong plastik masih berdasarkan kalibrasi visual awal. Setelah menekan MULAI, pindah kembali ke Warung Life Simulator dalam 3 detik. Capture harus tetap aktif."
+                "$description\n\nKoordinat barang dan kantong plastik masih berdasarkan kalibrasi visual awal. Setelah menekan MULAI, pindah kembali ke Warung Life Simulator dalam 1,5 detik. Capture harus tetap aktif."
             )
             .setNegativeButton("BATAL", null)
             .setPositiveButton("MULAI") { _, _ ->
@@ -494,7 +505,7 @@ class MainActivity : Activity() {
 
     private fun scheduleExecutionStart(singleItemOnly: Boolean) {
         pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
-        executionStatusText.text = "Bersiap. Pindah ke game sekarang; pemeriksaan akhir dan gesture dimulai dalam 3 detik."
+        executionStatusText.text = "Bersiap. Pindah ke game sekarang; pemeriksaan akhir dan gesture dimulai dalam 1,5 detik."
         val runnable = Runnable {
             pendingStartRunnable = null
             val accessibility = GestureAccessibilityService.instance
@@ -505,7 +516,7 @@ class MainActivity : Activity() {
             refreshGameSnapshotAndStart(singleItemOnly)
         }
         pendingStartRunnable = runnable
-        mainHandler.postDelayed(runnable, 3_000L)
+        mainHandler.postDelayed(runnable, GAME_SWITCH_DELAY_MS)
     }
 
     /**
@@ -513,17 +524,21 @@ class MainActivity : Activity() {
      * Ini mencegah penggunaan daftar pesanan/koordinat dari screenshot lama.
      */
     private fun refreshGameSnapshotAndStart(singleItemOnly: Boolean) {
+        ScreenCaptureService.setAutomationActive(true)
         if (!ScreenCaptureService.isRunning) {
+            ScreenCaptureService.setAutomationActive(false)
             executionStatusText.text = "Screen Capture berhenti. Antrean tidak dijalankan."
             return
         }
         val imageFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
         if (!imageFile.exists()) {
+            ScreenCaptureService.setAutomationActive(false)
             executionStatusText.text = "Belum ada frame game terbaru. Antrean tidak dijalankan."
             return
         }
         val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
         if (bitmap == null) {
+            ScreenCaptureService.setAutomationActive(false)
             executionStatusText.text = "Frame game terbaru tidak dapat dibaca. Antrean tidak dijalankan."
             return
         }
@@ -543,6 +558,7 @@ class MainActivity : Activity() {
                     isOcrRunning = false
 
                     val parsed = OrderParser.parse(result)
+                    updateVerificationRegion(result, imageWidth, imageHeight)
                     val detection = SmartItemDetector.detect(
                         ocrResult = result,
                         orders = parsed.items,
@@ -557,10 +573,12 @@ class MainActivity : Activity() {
 
                     val tasks = buildTasksFromSnapshot(parsed, detection, singleItemOnly)
                     if (tasks == null) {
+                        ScreenCaptureService.setAutomationActive(false)
                         executionStatusText.text = "Pemeriksaan akhir gagal: panel pesanan, jumlah, atau lokasi barang belum terbaca lengkap. Tidak ada gesture dikirim."
                         return@recognize
                     }
                     if (tasks.isEmpty()) {
+                        ScreenCaptureService.setAutomationActive(false)
                         executionStatusText.text = "Tidak ada item yang masih perlu diambil pada panel terbaru."
                         return@recognize
                     }
@@ -574,12 +592,14 @@ class MainActivity : Activity() {
                 onFailure = { exception ->
                     if (!bitmap.isRecycled) bitmap.recycle()
                     isOcrRunning = false
+                    ScreenCaptureService.setAutomationActive(false)
                     executionStatusText.text = "Pemeriksaan akhir OCR gagal: ${exception.message}. Tidak ada gesture dikirim."
                 }
             )
         } catch (exception: Exception) {
             if (!bitmap.isRecycled) bitmap.recycle()
             isOcrRunning = false
+            ScreenCaptureService.setAutomationActive(false)
             executionStatusText.text = "Pemeriksaan akhir gagal: ${exception.message}. Tidak ada gesture dikirim."
         }
     }
@@ -623,7 +643,7 @@ class MainActivity : Activity() {
             return
         }
         pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
-        executionStatusText.text = "Lanjutkan dipersiapkan. Pindah ke game dalam 3 detik."
+        executionStatusText.text = "Lanjutkan dipersiapkan. Pindah ke game dalam 1,5 detik."
         val runnable = Runnable {
             pendingStartRunnable = null
             val accessibility = GestureAccessibilityService.instance
@@ -631,10 +651,11 @@ class MainActivity : Activity() {
                 executionStatusText.text = "Game belum terdeteksi di depan. Antrean tetap dijeda."
                 return@Runnable
             }
+            ScreenCaptureService.setAutomationActive(true)
             manager.resume()
         }
         pendingStartRunnable = runnable
-        mainHandler.postDelayed(runnable, 3_000L)
+        mainHandler.postDelayed(runnable, GAME_SWITCH_DELAY_MS)
     }
 
     private fun beginAutomaticVerification(
@@ -644,6 +665,7 @@ class MainActivity : Activity() {
         requiredQuantity: Int
     ) {
         val captureFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
+        ScreenCaptureService.setAutomationActive(true)
         pendingVerification = PendingVerification(
             itemName = itemName,
             previousQuantity = previousQuantity,
@@ -652,8 +674,8 @@ class MainActivity : Activity() {
             attempts = 0,
             lastCaptureModified = if (captureFile.exists()) captureFile.lastModified() else 0L
         )
-        executionStatusText.text = "Drag $itemName telah dikirim. Menunggu frame game berikutnya untuk verifikasi OCR."
-        scheduleVerificationPoll(900L)
+        executionStatusText.text = "Drag $itemName dikirim. Memeriksa perubahan jumlah pada panel pesanan..."
+        scheduleVerificationPoll(FIRST_VERIFICATION_DELAY_MS)
     }
 
     private fun scheduleVerificationPoll(delayMs: Long) {
@@ -663,7 +685,7 @@ class MainActivity : Activity() {
     private fun pollAutomaticVerification() {
         val pending = pendingVerification ?: return
         if (isVerificationOcrRunning || isOcrRunning) {
-            scheduleVerificationPoll(500L)
+            scheduleVerificationPoll(150L)
             return
         }
         if (!ScreenCaptureService.isRunning) {
@@ -691,85 +713,252 @@ class MainActivity : Activity() {
             return
         }
 
+        recognizeVerificationFrame(pending, bitmap)
+    }
+
+    /**
+     * Verifikasi cepat menggunakan crop papan PESANAN. Jika crop tidak
+     * menghasilkan item/jumlah yang valid, fallback ke OCR layar penuh.
+     */
+    private fun recognizeVerificationFrame(
+        pending: PendingVerification,
+        fullBitmap: Bitmap
+    ) {
+        if (pendingVerification !== pending) {
+            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+            return
+        }
+
+        val fullWidth = fullBitmap.width
+        val fullHeight = fullBitmap.height
+        val cropRect = verificationRegion?.let { Rect(it) }?.apply {
+            intersect(0, 0, fullWidth, fullHeight)
+        }
+
+        val cropBitmap = try {
+            if (cropRect != null && cropRect.width() > 0 && cropRect.height() > 0 &&
+                (cropRect.width() < fullWidth || cropRect.height() < fullHeight)
+            ) {
+                Bitmap.createBitmap(
+                    fullBitmap,
+                    cropRect.left,
+                    cropRect.top,
+                    cropRect.width(),
+                    cropRect.height()
+                )
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+
+        val useCrop = cropBitmap != null
+        val inputBitmap = cropBitmap ?: fullBitmap
         isVerificationOcrRunning = true
         val recognizer = textRecognizer
             ?: OrderTextRecognizer().also { textRecognizer = it }
 
         try {
             recognizer.recognize(
-                bitmap = bitmap,
+                bitmap = inputBitmap,
                 onSuccess = { result ->
-                    if (!bitmap.isRecycled) bitmap.recycle()
-                    isVerificationOcrRunning = false
-                    val parsed = OrderParser.parse(result)
-                    if (!parsed.headerFound || parsed.items.isEmpty()) {
-                        executionManager?.verificationFailed(
-                            "Panel PESANAN tidak terbaca. Kemungkinan ada interupsi atau pelanggan sedang berganti; selesaikan secara manual lalu tekan LANJUTKAN untuk memeriksa ulang"
-                        )
-                        pendingVerification = null
-                        return@recognize
+                    if (inputBitmap !== fullBitmap && !inputBitmap.isRecycled) {
+                        inputBitmap.recycle()
                     }
 
+                    val parsed = OrderParser.parse(result)
                     val item = parsed.items.firstOrNull {
                         normalizeItemName(it.name) == normalizeItemName(pending.itemName)
                     }
-                    if (item == null) {
-                        executionManager?.verificationFailed(
-                            "Item ${pending.itemName} tidak ditemukan pada panel terbaru. Periksa kemungkinan pergantian pelanggan atau interupsi"
+                    val cropNeedsFallback = useCrop && (
+                        !parsed.headerFound || parsed.items.isEmpty() || item == null ||
+                            item.currentQuantity == null || item.requiredQuantity == null
                         )
-                        pendingVerification = null
+
+                    if (cropNeedsFallback) {
+                        recognizeVerificationFullScreenFallback(pending, fullBitmap)
                         return@recognize
                     }
 
-                    if (
-                        item.currentQuantity == pending.expectedQuantity &&
-                        item.requiredQuantity == pending.requiredQuantity
-                    ) {
-                        pendingVerification = null
-                        executionManager?.confirmQuantity(
-                            itemName = item.name,
-                            observedCurrentQuantity = item.currentQuantity,
-                            observedRequiredQuantity = item.requiredQuantity
-                        )
-                    } else if (
-                        item.currentQuantity == pending.previousQuantity &&
-                        item.requiredQuantity == pending.requiredQuantity &&
-                        pending.attempts < 5
-                    ) {
-                        pending.attempts++
-                        executionStatusText.text = "Jumlah ${pending.itemName} belum berubah pada OCR (${pending.attempts}/5). Menunggu frame berikutnya."
-                        scheduleVerificationPoll(900L)
+                    if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                    isVerificationOcrRunning = false
+                    if (pendingVerification !== pending) return@recognize
+
+                    if (!useCrop) {
+                        updateVerificationRegion(result, fullWidth, fullHeight)
+                    }
+                    processVerificationResult(pending, parsed)
+                },
+                onFailure = { exception ->
+                    if (inputBitmap !== fullBitmap && !inputBitmap.isRecycled) {
+                        inputBitmap.recycle()
+                    }
+                    if (useCrop) {
+                        recognizeVerificationFullScreenFallback(pending, fullBitmap)
                     } else {
-                        pendingVerification = null
-                        executionManager?.confirmQuantity(
-                            itemName = item.name,
-                            observedCurrentQuantity = item.currentQuantity,
-                            observedRequiredQuantity = item.requiredQuantity
+                        if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                        isVerificationOcrRunning = false
+                        retryOrFailVerification(
+                            "OCR gagal: ${exception.message ?: "kesalahan tidak diketahui"}"
                         )
                     }
+                }
+            )
+        } catch (exception: Exception) {
+            if (inputBitmap !== fullBitmap && !inputBitmap.isRecycled) {
+                inputBitmap.recycle()
+            }
+            if (useCrop) {
+                recognizeVerificationFullScreenFallback(pending, fullBitmap)
+            } else {
+                if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                isVerificationOcrRunning = false
+                retryOrFailVerification(
+                    "OCR gagal: ${exception.message ?: "kesalahan tidak diketahui"}"
+                )
+            }
+        }
+    }
+
+    private fun recognizeVerificationFullScreenFallback(
+        pending: PendingVerification,
+        bitmap: Bitmap
+    ) {
+        if (pendingVerification !== pending) {
+            if (!bitmap.isRecycled) bitmap.recycle()
+            isVerificationOcrRunning = false
+            return
+        }
+
+        val recognizer = textRecognizer
+            ?: OrderTextRecognizer().also { textRecognizer = it }
+        try {
+            recognizer.recognize(
+                bitmap = bitmap,
+                onSuccess = { result ->
+                    val width = bitmap.width
+                    val height = bitmap.height
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    isVerificationOcrRunning = false
+                    if (pendingVerification !== pending) return@recognize
+                    updateVerificationRegion(result, width, height)
+                    processVerificationResult(pending, OrderParser.parse(result))
                 },
                 onFailure = { exception ->
                     if (!bitmap.isRecycled) bitmap.recycle()
                     isVerificationOcrRunning = false
-                    retryOrFailVerification("OCR gagal: ${exception.message ?: "kesalahan tidak diketahui"}")
+                    retryOrFailVerification(
+                        "OCR layar penuh gagal: ${exception.message ?: "kesalahan tidak diketahui"}"
+                    )
                 }
             )
         } catch (exception: Exception) {
             if (!bitmap.isRecycled) bitmap.recycle()
             isVerificationOcrRunning = false
-            retryOrFailVerification("OCR gagal: ${exception.message ?: "kesalahan tidak diketahui"}")
+            retryOrFailVerification(
+                "OCR layar penuh gagal: ${exception.message ?: "kesalahan tidak diketahui"}"
+            )
         }
+    }
+
+    private fun processVerificationResult(
+        pending: PendingVerification,
+        parsed: OrderParseResult
+    ) {
+        if (pendingVerification !== pending) return
+
+        if (!parsed.headerFound || parsed.items.isEmpty()) {
+            executionManager?.verificationFailed(
+                "Panel PESANAN tidak terbaca. Kemungkinan ada interupsi atau pelanggan sedang berganti; selesaikan secara manual lalu tekan LANJUTKAN untuk memeriksa ulang"
+            )
+            pendingVerification = null
+            return
+        }
+
+        val item = parsed.items.firstOrNull {
+            normalizeItemName(it.name) == normalizeItemName(pending.itemName)
+        }
+        if (item == null) {
+            executionManager?.verificationFailed(
+                "Item ${pending.itemName} tidak ditemukan pada panel terbaru. Periksa kemungkinan pergantian pelanggan atau interupsi"
+            )
+            pendingVerification = null
+            return
+        }
+
+        if (
+            item.currentQuantity == pending.expectedQuantity &&
+            item.requiredQuantity == pending.requiredQuantity
+        ) {
+            pendingVerification = null
+            executionManager?.confirmQuantity(
+                itemName = item.name,
+                observedCurrentQuantity = item.currentQuantity,
+                observedRequiredQuantity = item.requiredQuantity
+            )
+        } else if (
+            item.currentQuantity == pending.previousQuantity &&
+            item.requiredQuantity == pending.requiredQuantity &&
+            pending.attempts < MAX_VERIFICATION_ATTEMPTS - 1
+        ) {
+            pending.attempts++
+            executionStatusText.text = "Jumlah ${pending.itemName} belum berubah pada OCR (${pending.attempts + 1}/$MAX_VERIFICATION_ATTEMPTS). Memeriksa frame berikutnya."
+            scheduleVerificationPoll(verificationRetryDelay(pending.attempts))
+        } else {
+            pendingVerification = null
+            executionManager?.confirmQuantity(
+                itemName = item.name,
+                observedCurrentQuantity = item.currentQuantity,
+                observedRequiredQuantity = item.requiredQuantity
+            )
+        }
+    }
+
+    private fun verificationRetryDelay(retryNumber: Int): Long = when (retryNumber) {
+        1 -> 350L
+        2 -> 500L
+        else -> 500L
     }
 
     private fun retryOrFailVerification(reason: String) {
         val pending = pendingVerification ?: return
-        if (pending.attempts < 5) {
+        if (pending.attempts < MAX_VERIFICATION_ATTEMPTS - 1) {
             pending.attempts++
-            executionStatusText.text = "$reason Mencoba membaca frame baru (${pending.attempts}/5)."
-            scheduleVerificationPoll(900L)
+            executionStatusText.text = "$reason Mencoba membaca frame baru (${pending.attempts + 1}/$MAX_VERIFICATION_ATTEMPTS)."
+            scheduleVerificationPoll(verificationRetryDelay(pending.attempts))
         } else {
             pendingVerification = null
-            executionManager?.verificationFailed("Verifikasi tidak berhasil setelah beberapa frame. $reason Tidak ada drag ulang otomatis")
+            executionManager?.verificationFailed(
+                "Verifikasi tidak berhasil setelah $MAX_VERIFICATION_ATTEMPTS frame. $reason Tidak ada drag ulang otomatis"
+            )
+        }
+    }
+
+    private fun updateVerificationRegion(
+        result: OcrResult,
+        imageWidth: Int,
+        imageHeight: Int
+    ) {
+        val header = result.lines.firstOrNull { line ->
+            normalizeItemName(line.text).contains("pesanan")
+        }
+        if (header == null || imageWidth <= 0 || imageHeight <= 0) {
+            verificationRegion = null
+            return
+        }
+
+        // Parser uses a 260px horizontal margin and 250px vertical range
+        // around the PESANAN header. Add a little safety margin for OCR boxes.
+        val left = (header.left - 300).coerceAtLeast(0)
+        val top = (header.top - 24).coerceAtLeast(0)
+        val right = (header.right + 300).coerceAtMost(imageWidth)
+        val bottom = (header.bottom + 290).coerceAtMost(imageHeight)
+
+        verificationRegion = if (right > left && bottom > top) {
+            Rect(left, top, right, bottom)
+        } else {
+            null
         }
     }
 
@@ -1049,6 +1238,7 @@ class MainActivity : Activity() {
 
                     // Parser dan detector memakai hasil OCR yang sama.
                     val parsed = OrderParser.parse(result)
+                    updateVerificationRegion(result, imageWidth, imageHeight)
 
                     val detection = SmartItemDetector.detect(
                         ocrResult = result,
@@ -1447,6 +1637,8 @@ class MainActivity : Activity() {
         pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingStartRunnable = null
         pendingVerification = null
+        ScreenCaptureService.setAutomationActive(false)
+        verificationRegion = null
         executionManager?.stop()
         executionManager = null
         textRecognizer?.close()
