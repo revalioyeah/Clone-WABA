@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -26,6 +28,8 @@ class GestureAccessibilityService : AccessibilityService() {
     }
 
     private var gestureInProgress = false
+    @Volatile
+    private var tapBatchGeneration = 0
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -50,11 +54,13 @@ class GestureAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
+        tapBatchGeneration++
         gestureInProgress = false
     }
 
     override fun onDestroy() {
         if (instance === this) instance = null
+        tapBatchGeneration++
         gestureInProgress = false
         super.onDestroy()
     }
@@ -288,6 +294,93 @@ class GestureAccessibilityService : AccessibilityService() {
             onComplete(false, "Android menolak dispatch gesture tap.")
         }
         return accepted
+    }
+
+    /** Prevents any not-yet-dispatched tap in the current batch. */
+    fun cancelPendingTapBatch() {
+        tapBatchGeneration++
+    }
+
+    /**
+     * Sends a short sequence of taps at one cached product coordinate.
+     * The queue is deliberately capped by TargetGameConfig.MAX_TAPS_PER_BATCH.
+     * Each tap completes before the next one is dispatched.
+     */
+    fun tapRepeated(
+        x: Float,
+        y: Float,
+        tapCount: Int,
+        durationMs: Long = TargetGameConfig.TAP_DURATION_MS,
+        intervalMs: Long = TargetGameConfig.TAP_INTERVAL_MS,
+        onComplete: (Boolean, String, Int) -> Unit
+    ): Boolean {
+        if (tapCount !in 1..TargetGameConfig.MAX_TAPS_PER_BATCH) {
+            onComplete(
+                false,
+                "Jumlah tap batch harus 1 sampai ${TargetGameConfig.MAX_TAPS_PER_BATCH}.",
+                0
+            )
+            return false
+        }
+        if (intervalMs < 0L || durationMs <= 0L) {
+            onComplete(false, "Durasi atau interval tap tidak valid.", 0)
+            return false
+        }
+        if (!TargetGameConfig.isConfigured || !isTargetGameForeground()) {
+            onComplete(false, "Target game tidak aktif atau belum dikonfigurasi.", 0)
+            return false
+        }
+
+        val handler = Handler(Looper.getMainLooper())
+        val batchGeneration = ++tapBatchGeneration
+        var completedCount = 0
+        var callbackSent = false
+
+        fun finish(success: Boolean, detail: String) {
+            if (callbackSent) return
+            callbackSent = true
+            onComplete(success, detail, completedCount)
+        }
+
+        fun dispatchNextTap() {
+            if (callbackSent) return
+            if (batchGeneration != tapBatchGeneration) {
+                finish(false, "Batch tap dihentikan sebelum seluruh tap dikirim.")
+                return
+            }
+            if (!isTargetGameForeground()) {
+                finish(false, "Game kehilangan fokus di tengah batch tap.")
+                return
+            }
+
+            // tap() invokes its callback for both asynchronous completion and
+            // immediate rejection, so no second error callback is needed here.
+            tap(
+                x = x,
+                y = y,
+                durationMs = durationMs
+            ) { success, detail ->
+                if (!success) {
+                    finish(false, detail)
+                    return@tap
+                }
+
+                completedCount++
+                if (completedCount >= tapCount) {
+                    finish(true, "$completedCount tap selesai dikirim.")
+                } else if (batchGeneration != tapBatchGeneration) {
+                    finish(false, "Batch tap dihentikan setelah $completedCount tap.")
+                } else {
+                    handler.postDelayed(
+                        { dispatchNextTap() },
+                        intervalMs
+                    )
+                }
+            }
+        }
+
+        handler.post { dispatchNextTap() }
+        return true
     }
 
     private fun finishGesture() {
