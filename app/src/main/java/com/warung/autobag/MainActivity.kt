@@ -1,6 +1,7 @@
 package com.warung.autobag
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -13,8 +14,11 @@ import android.graphics.RectF
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -23,7 +27,12 @@ import android.widget.Toast
 import com.warung.autobag.capture.ScreenCaptureService
 import com.warung.autobag.detection.SmartDetectionResult
 import com.warung.autobag.detection.SmartItemDetector
+import com.warung.autobag.gesture.GestureAccessibilityService
+import com.warung.autobag.gesture.GestureController
+import com.warung.autobag.gesture.OrderExecutionManager
+import com.warung.autobag.gesture.TargetGameConfig
 import com.warung.autobag.ocr.OrderParser
+import com.warung.autobag.ocr.OrderParseResult
 import com.warung.autobag.ocr.OrderTextRecognizer
 import java.io.File
 
@@ -42,7 +51,29 @@ class MainActivity : Activity() {
 
     private var textRecognizer: OrderTextRecognizer? = null
     private var isOcrRunning = false
+    private var isVerificationOcrRunning = false
     private var displayedBitmap: Bitmap? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var executionManager: OrderExecutionManager? = null
+    private lateinit var executionStatusText: TextView
+    private lateinit var calibrationCheckBox: CheckBox
+    private var latestParsedOrder: OrderParseResult? = null
+    private var latestDetection: SmartDetectionResult? = null
+    private var latestImageWidth = 0
+    private var latestImageHeight = 0
+    private var latestCaptureModifiedAtOcr = 0L
+    private var pendingVerification: PendingVerification? = null
+    private var pendingStartRunnable: Runnable? = null
+
+    private data class PendingVerification(
+        val itemName: String,
+        val previousQuantity: Int,
+        val expectedQuantity: Int,
+        val requiredQuantity: Int,
+        var attempts: Int,
+        var lastCaptureModified: Long
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -126,9 +157,68 @@ class MainActivity : Activity() {
                 orderResultText.text = "Belum ada hasil parsing pesanan."
                 detectionResultText.text = "Belum ada hasil deteksi lokasi barang."
                 ocrResultText.text = "Belum ada hasil OCR."
+                latestParsedOrder = null
+                latestDetection = null
+                latestCaptureModifiedAtOcr = 0L
                 statusText.text = "Hasil pembacaan telah dibersihkan."
                 showLatestCapture()
             }
+        }
+
+        val automationHeading = createHeading("GESTURE AUTOMATION — TAHAP UJI")
+
+        executionStatusText = TextView(this).apply {
+            text = "Status: otomatisasi belum dijalankan."
+            textSize = 14f
+            setTextColor(Color.DKGRAY)
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+
+        calibrationCheckBox = CheckBox(this).apply {
+            text = "Saya sudah memeriksa titik hijau setiap barang dan titik biru kantong plastik pada preview."
+            textSize = 13f
+            setTextColor(Color.DKGRAY)
+        }
+
+        val testOneItemButton = Button(this).apply {
+            text = "UJI GESTURE — 1 BARANG"
+            setOnClickListener { prepareAutomaticExecution(singleItemOnly = true) }
+        }
+
+        val startAutomaticButton = Button(this).apply {
+            text = "MULAI OTOMATIS — SEMUA PESANAN"
+            setOnClickListener { prepareAutomaticExecution(singleItemOnly = false) }
+        }
+
+        val pauseAutomaticButton = Button(this).apply {
+            text = "PAUSE"
+            setOnClickListener {
+                pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
+                pendingStartRunnable = null
+                executionManager?.pause()
+            }
+        }
+
+        val resumeAutomaticButton = Button(this).apply {
+            text = "LANJUTKAN"
+            setOnClickListener { scheduleResumeAfterGameSwitch() }
+        }
+
+        val stopAutomaticButton = Button(this).apply {
+            text = "STOP"
+            setOnClickListener {
+                pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
+                pendingStartRunnable = null
+                pendingVerification = null
+                executionManager?.stop()
+            }
+        }
+
+        val automationNote = TextView(this).apply {
+            text = "Capture harus tetap aktif selama otomatisasi agar setiap drag dapat diverifikasi dengan OCR. Setelah menekan MULAI, pindah kembali ke game dalam 3 detik. Jika panel pesanan tidak terbaca atau muncul interupsi, antrean akan dijeda tanpa mengulang drag secara buta."
+            textSize = 12f
+            setTextColor(Color.DKGRAY)
         }
 
         val parsedHeading = createHeading("HASIL PESANAN TERSTRUKTUR")
@@ -176,17 +266,19 @@ class MainActivity : Activity() {
                 2. Setujui izin perekaman layar Android.
                 3. Pindah ke Warung Life Simulator.
                 4. Tunggu sampai papan pesanan pelanggan terlihat.
-                5. Hentikan capture melalui notifikasi Android.
-                6. Kembali ke aplikasi.
+                5. Biarkan Screen Capture tetap aktif.
+                6. Kembali ke aplikasi assistant melalui Recent Apps.
                 7. Tekan BACA PESANAN & DETEKSI LOKASI.
                 8. Periksa daftar pesanan dan penanda hijau pada preview.
-                9. Cocokkan penanda dengan gambar barang yang sebenarnya.
+                9. Cocokkan penanda hijau dengan gambar barang dan penanda biru dengan kantong plastik.
+                10. Centang konfirmasi kalibrasi, lalu tekan UJI GESTURE — 1 BARANG.
+                11. Pindah ke game dalam 3 detik dan amati hasilnya.
 
                 CATATAN PENTING:
-                - Deteksi versi ini mencocokkan label OCR pada area rak.
-                - Titik hijau adalah estimasi posisi produk berdasarkan label.
-                - Koordinat belum boleh dipakai sebagai koordinat sentuh otomatis.
-                - Belum ada gesture mengambil atau memasukkan barang.
+                - Titik hijau masih merupakan estimasi posisi produk.
+                - Titik biru kantong plastik juga merupakan kalibrasi awal.
+                - Otomatisasi hanya boleh dimulai setelah kedua titik diperiksa.
+                - Setiap drag harus dikonfirmasi melalui pembacaan OCR baru.
             """.trimIndent()
             textSize = 13f
             setTextColor(Color.DKGRAY)
@@ -216,7 +308,16 @@ class MainActivity : Activity() {
         page.addView(orderHeading, marginParams(10))
         page.addView(orderDescription, marginParams(8))
         page.addView(ocrButton, marginParams(8))
-        page.addView(clearButton, marginParams(8))
+        page.addView(clearButton, marginParams(12))
+        page.addView(automationHeading, marginParams(10))
+        page.addView(executionStatusText, marginParams(8))
+        page.addView(calibrationCheckBox, marginParams(8))
+        page.addView(testOneItemButton, marginParams(6))
+        page.addView(startAutomaticButton, marginParams(6))
+        page.addView(pauseAutomaticButton, marginParams(6))
+        page.addView(resumeAutomaticButton, marginParams(6))
+        page.addView(stopAutomaticButton, marginParams(6))
+        page.addView(automationNote, marginParams(14))
         page.addView(parsedHeading, marginParams(12))
         page.addView(orderResultText, marginParams(18))
         page.addView(detectionHeading, marginParams(12))
@@ -226,7 +327,454 @@ class MainActivity : Activity() {
         page.addView(instruction, marginParams())
 
         setContentView(scrollView)
+        createExecutionManager()
     }
+
+
+    private fun createExecutionManager() {
+        executionManager = OrderExecutionManager(
+            dragDispatcher = OrderExecutionManager.DragDispatcher { source, destination, onComplete ->
+                if (latestImageWidth <= 0 || latestImageHeight <= 0) {
+                    onComplete(false, "Ukuran screenshot terakhir belum tersedia.")
+                } else {
+                    val bagPoint = OrderExecutionManager.PixelPoint(
+                        x = latestImageWidth * TargetGameConfig.BAG_X_RATIO,
+                        y = latestImageHeight * TargetGameConfig.BAG_Y_RATIO
+                    )
+
+                    GestureController.executeOneItemFromImage(
+                        sourceImagePoint = GestureController.ScreenPoint(source.x, source.y),
+                        bagImagePoint = GestureController.ScreenPoint(bagPoint.x, bagPoint.y),
+                        imageWidth = latestImageWidth,
+                        imageHeight = latestImageHeight,
+                        onComplete = onComplete
+                    )
+                }
+            },
+            listener = object : OrderExecutionManager.Listener {
+                override fun onStateChanged(snapshot: OrderExecutionManager.Snapshot) {
+                    runOnUiThread {
+                        if (!isFinishing && !isDestroyed && ::executionStatusText.isInitialized) {
+                            executionStatusText.text = buildString {
+                                appendLine("STATUS: ${snapshot.state}")
+                                appendLine(snapshot.message)
+                                if (snapshot.currentItem != null) {
+                                    appendLine("Item aktif: ${snapshot.currentItem}")
+                                    appendLine("Progres: ${snapshot.currentQuantity}/${snapshot.requiredQuantity}")
+                                }
+                                append("Jenis pesanan selesai: ${snapshot.completedOrderTypes}/${snapshot.totalOrderTypes}; gesture terkirim: ${snapshot.dispatchedGestures}")
+                            }
+                        }
+                    }
+                }
+
+                override fun onVerificationRequired(
+                    itemName: String,
+                    previousQuantity: Int,
+                    expectedQuantity: Int,
+                    requiredQuantity: Int
+                ) {
+                    runOnUiThread {
+                        beginAutomaticVerification(
+                            itemName = itemName,
+                            previousQuantity = previousQuantity,
+                            expectedQuantity = expectedQuantity,
+                            requiredQuantity = requiredQuantity
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    private fun prepareAutomaticExecution(singleItemOnly: Boolean) {
+        if (isOcrRunning || isVerificationOcrRunning) {
+            executionStatusText.text = "OCR sedang berjalan. Tunggu sampai selesai."
+            return
+        }
+        when (executionManager?.state) {
+            OrderExecutionManager.State.RUNNING,
+            OrderExecutionManager.State.WAITING_VERIFICATION,
+            OrderExecutionManager.State.PAUSED -> {
+                executionStatusText.text = "Antrean sudah aktif atau dijeda. Gunakan PAUSE, LANJUTKAN, atau STOP; jangan mulai antrean baru."
+                return
+            }
+            else -> Unit
+        }
+        if (!calibrationCheckBox.isChecked) {
+            executionStatusText.text = "Centang konfirmasi setelah memeriksa titik hijau dan titik biru pada preview."
+            return
+        }
+        if (!ScreenCaptureService.isRunning) {
+            executionStatusText.text = "Screen Capture belum aktif. Aktifkan dan biarkan berjalan selama otomatisasi."
+            return
+        }
+        val accessibility = GestureAccessibilityService.instance
+        if (accessibility == null) {
+            executionStatusText.text = "Gesture Accessibility Service belum aktif. Aktifkan melalui Pengaturan Android."
+            return
+        }
+        if (!TargetGameConfig.isConfigured) {
+            executionStatusText.text = "Package game belum dikonfigurasi. Gesture dibatalkan."
+            return
+        }
+        val captureFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
+        if (!captureFile.exists() || captureFile.lastModified() != latestCaptureModifiedAtOcr) {
+            executionStatusText.text = "Capture berubah sejak OCR terakhir. Baca ulang pesanan dan deteksi lokasi sebelum menjalankan gesture."
+            return
+        }
+
+        val parsed = latestParsedOrder
+        val detection = latestDetection
+        if (parsed == null || detection == null || latestImageWidth <= 0 || latestImageHeight <= 0) {
+            executionStatusText.text = "Baca pesanan dan deteksi lokasi terlebih dahulu."
+            return
+        }
+        if (!parsed.headerFound || parsed.items.isEmpty()) {
+            executionStatusText.text = "Panel PESANAN belum terbaca. Belum ada antrean yang dapat dijalankan."
+            return
+        }
+
+        val pendingOrders = parsed.items.filter { order ->
+            val current = order.currentQuantity
+            val required = order.requiredQuantity
+            current != null && required != null && current < required
+        }
+        if (pendingOrders.isEmpty()) {
+            executionStatusText.text = "Tidak ada item yang belum terpenuhi atau jumlah pesanan belum valid."
+            return
+        }
+
+        val unknownQuantities = parsed.items.filter {
+            it.currentQuantity == null || it.requiredQuantity == null
+        }
+        if (unknownQuantities.isNotEmpty()) {
+            executionStatusText.text = "Jumlah belum terbaca untuk: ${unknownQuantities.joinToString { it.name }}. Periksa OCR sebelum menjalankan gesture."
+            return
+        }
+
+        val detectionByName = detection.detections.associateBy { normalizeItemName(it.itemName) }
+        val missingLocations = pendingOrders.filter {
+            detectionByName[normalizeItemName(it.name)] == null
+        }
+        if (missingLocations.isNotEmpty()) {
+            executionStatusText.text = "Lokasi belum ditemukan untuk: ${missingLocations.joinToString { it.name }}. Tidak ada gesture yang dikirim."
+            return
+        }
+
+        val tasks = pendingOrders.map { order ->
+            val detected = detectionByName[normalizeItemName(order.name)]!!
+            OrderExecutionManager.OrderTask(
+                itemName = order.name,
+                currentQuantity = order.currentQuantity!!,
+                requiredQuantity = order.requiredQuantity!!,
+                source = OrderExecutionManager.PixelPoint(
+                    detected.targetX,
+                    detected.targetY
+                )
+            )
+        }.let { if (singleItemOnly) it.take(1) else it }
+
+        val mode = if (singleItemOnly) "UJI SATU BARANG" else "OTOMATIS SEMUA PESANAN"
+        val description = tasks.joinToString("\n") {
+            "• ${it.itemName}: ${it.currentQuantity}/${it.requiredQuantity}"
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Konfirmasi $mode")
+            .setMessage(
+                "$description\n\nKoordinat barang dan kantong plastik masih berdasarkan kalibrasi visual awal. Setelah menekan MULAI, pindah kembali ke Warung Life Simulator dalam 3 detik. Capture harus tetap aktif."
+            )
+            .setNegativeButton("BATAL", null)
+            .setPositiveButton("MULAI") { _, _ ->
+                scheduleExecutionStart(singleItemOnly)
+            }
+            .show()
+    }
+
+    private fun scheduleExecutionStart(singleItemOnly: Boolean) {
+        pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
+        executionStatusText.text = "Bersiap. Pindah ke game sekarang; pemeriksaan akhir dan gesture dimulai dalam 3 detik."
+        val runnable = Runnable {
+            pendingStartRunnable = null
+            val accessibility = GestureAccessibilityService.instance
+            if (accessibility == null || !accessibility.isTargetGameForeground()) {
+                executionStatusText.text = "Game belum terdeteksi di depan. Tidak ada gesture dikirim. Tekan MULAI lagi setelah siap."
+                return@Runnable
+            }
+            refreshGameSnapshotAndStart(singleItemOnly)
+        }
+        pendingStartRunnable = runnable
+        mainHandler.postDelayed(runnable, 3_000L)
+    }
+
+    /**
+     * Membaca ulang frame setelah game kembali berada di depan.
+     * Ini mencegah penggunaan daftar pesanan/koordinat dari screenshot lama.
+     */
+    private fun refreshGameSnapshotAndStart(singleItemOnly: Boolean) {
+        if (!ScreenCaptureService.isRunning) {
+            executionStatusText.text = "Screen Capture berhenti. Antrean tidak dijalankan."
+            return
+        }
+        val imageFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
+        if (!imageFile.exists()) {
+            executionStatusText.text = "Belum ada frame game terbaru. Antrean tidak dijalankan."
+            return
+        }
+        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+        if (bitmap == null) {
+            executionStatusText.text = "Frame game terbaru tidak dapat dibaca. Antrean tidak dijalankan."
+            return
+        }
+
+        val imageWidth = bitmap.width
+        val imageHeight = bitmap.height
+        isOcrRunning = true
+        executionStatusText.text = "Memeriksa ulang panel pesanan dan lokasi barang pada frame game terbaru..."
+        val recognizer = textRecognizer
+            ?: OrderTextRecognizer().also { textRecognizer = it }
+
+        try {
+            recognizer.recognize(
+                bitmap = bitmap,
+                onSuccess = { result ->
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    isOcrRunning = false
+
+                    val parsed = OrderParser.parse(result)
+                    val detection = SmartItemDetector.detect(
+                        ocrResult = result,
+                        orders = parsed.items,
+                        imageWidth = imageWidth,
+                        imageHeight = imageHeight
+                    )
+                    latestParsedOrder = parsed
+                    latestDetection = detection
+                    latestImageWidth = imageWidth
+                    latestImageHeight = imageHeight
+                    latestCaptureModifiedAtOcr = imageFile.lastModified()
+
+                    val tasks = buildTasksFromSnapshot(parsed, detection, singleItemOnly)
+                    if (tasks == null) {
+                        executionStatusText.text = "Pemeriksaan akhir gagal: panel pesanan, jumlah, atau lokasi barang belum terbaca lengkap. Tidak ada gesture dikirim."
+                        return@recognize
+                    }
+                    if (tasks.isEmpty()) {
+                        executionStatusText.text = "Tidak ada item yang masih perlu diambil pada panel terbaru."
+                        return@recognize
+                    }
+
+                    val bagPoint = OrderExecutionManager.PixelPoint(
+                        latestImageWidth * TargetGameConfig.BAG_X_RATIO,
+                        latestImageHeight * TargetGameConfig.BAG_Y_RATIO
+                    )
+                    executionManager?.start(tasks, bagPoint)
+                },
+                onFailure = { exception ->
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    isOcrRunning = false
+                    executionStatusText.text = "Pemeriksaan akhir OCR gagal: ${exception.message}. Tidak ada gesture dikirim."
+                }
+            )
+        } catch (exception: Exception) {
+            if (!bitmap.isRecycled) bitmap.recycle()
+            isOcrRunning = false
+            executionStatusText.text = "Pemeriksaan akhir gagal: ${exception.message}. Tidak ada gesture dikirim."
+        }
+    }
+
+    private fun buildTasksFromSnapshot(
+        parsed: OrderParseResult,
+        detection: SmartDetectionResult,
+        singleItemOnly: Boolean
+    ): List<OrderExecutionManager.OrderTask>? {
+        if (!parsed.headerFound || parsed.items.isEmpty()) return null
+        if (parsed.items.any { it.currentQuantity == null || it.requiredQuantity == null }) return null
+
+        val pendingOrders = parsed.items.filter {
+            it.currentQuantity!! < it.requiredQuantity!!
+        }
+        if (pendingOrders.isEmpty()) return emptyList()
+
+        val detectionsByName = detection.detections.associateBy {
+            normalizeItemName(it.itemName)
+        }
+        if (pendingOrders.any { detectionsByName[normalizeItemName(it.name)] == null }) {
+            return null
+        }
+
+        val tasks = pendingOrders.map { order ->
+            val detected = detectionsByName[normalizeItemName(order.name)]!!
+            OrderExecutionManager.OrderTask(
+                itemName = order.name,
+                currentQuantity = order.currentQuantity!!,
+                requiredQuantity = order.requiredQuantity!!,
+                source = OrderExecutionManager.PixelPoint(detected.targetX, detected.targetY)
+            )
+        }
+        return if (singleItemOnly) tasks.take(1) else tasks
+    }
+
+    private fun scheduleResumeAfterGameSwitch() {
+        val manager = executionManager
+        if (manager == null || manager.state != OrderExecutionManager.State.PAUSED) {
+            executionStatusText.text = "Tidak ada antrean yang sedang dijeda."
+            return
+        }
+        pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
+        executionStatusText.text = "Lanjutkan dipersiapkan. Pindah ke game dalam 3 detik."
+        val runnable = Runnable {
+            pendingStartRunnable = null
+            val accessibility = GestureAccessibilityService.instance
+            if (accessibility == null || !accessibility.isTargetGameForeground()) {
+                executionStatusText.text = "Game belum terdeteksi di depan. Antrean tetap dijeda."
+                return@Runnable
+            }
+            manager.resume()
+        }
+        pendingStartRunnable = runnable
+        mainHandler.postDelayed(runnable, 3_000L)
+    }
+
+    private fun beginAutomaticVerification(
+        itemName: String,
+        previousQuantity: Int,
+        expectedQuantity: Int,
+        requiredQuantity: Int
+    ) {
+        val captureFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
+        pendingVerification = PendingVerification(
+            itemName = itemName,
+            previousQuantity = previousQuantity,
+            expectedQuantity = expectedQuantity,
+            requiredQuantity = requiredQuantity,
+            attempts = 0,
+            lastCaptureModified = if (captureFile.exists()) captureFile.lastModified() else 0L
+        )
+        executionStatusText.text = "Drag $itemName telah dikirim. Menunggu frame game berikutnya untuk verifikasi OCR."
+        scheduleVerificationPoll(900L)
+    }
+
+    private fun scheduleVerificationPoll(delayMs: Long) {
+        mainHandler.postDelayed({ pollAutomaticVerification() }, delayMs)
+    }
+
+    private fun pollAutomaticVerification() {
+        val pending = pendingVerification ?: return
+        if (isVerificationOcrRunning || isOcrRunning) {
+            scheduleVerificationPoll(500L)
+            return
+        }
+        if (!ScreenCaptureService.isRunning) {
+            executionManager?.verificationFailed("Screen Capture berhenti sebelum verifikasi selesai")
+            pendingVerification = null
+            return
+        }
+
+        val imageFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
+        if (!imageFile.exists()) {
+            retryOrFailVerification("File capture belum tersedia.")
+            return
+        }
+
+        val modified = imageFile.lastModified()
+        if (modified <= pending.lastCaptureModified) {
+            retryOrFailVerification("Menunggu frame game baru.")
+            return
+        }
+        pending.lastCaptureModified = modified
+
+        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+        if (bitmap == null) {
+            retryOrFailVerification("Frame game tidak dapat dibaca.")
+            return
+        }
+
+        isVerificationOcrRunning = true
+        val recognizer = textRecognizer
+            ?: OrderTextRecognizer().also { textRecognizer = it }
+
+        try {
+            recognizer.recognize(
+                bitmap = bitmap,
+                onSuccess = { result ->
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    isVerificationOcrRunning = false
+                    val parsed = OrderParser.parse(result)
+                    if (!parsed.headerFound || parsed.items.isEmpty()) {
+                        executionManager?.verificationFailed(
+                            "Panel PESANAN tidak terbaca. Kemungkinan ada interupsi atau pelanggan sedang berganti; selesaikan secara manual lalu tekan LANJUTKAN untuk memeriksa ulang"
+                        )
+                        pendingVerification = null
+                        return@recognize
+                    }
+
+                    val item = parsed.items.firstOrNull {
+                        normalizeItemName(it.name) == normalizeItemName(pending.itemName)
+                    }
+                    if (item == null) {
+                        executionManager?.verificationFailed(
+                            "Item ${pending.itemName} tidak ditemukan pada panel terbaru. Periksa kemungkinan pergantian pelanggan atau interupsi"
+                        )
+                        pendingVerification = null
+                        return@recognize
+                    }
+
+                    if (
+                        item.currentQuantity == pending.expectedQuantity &&
+                        item.requiredQuantity == pending.requiredQuantity
+                    ) {
+                        pendingVerification = null
+                        executionManager?.confirmQuantity(
+                            itemName = item.name,
+                            observedCurrentQuantity = item.currentQuantity,
+                            observedRequiredQuantity = item.requiredQuantity
+                        )
+                    } else if (
+                        item.currentQuantity == pending.previousQuantity &&
+                        item.requiredQuantity == pending.requiredQuantity &&
+                        pending.attempts < 5
+                    ) {
+                        pending.attempts++
+                        executionStatusText.text = "Jumlah ${pending.itemName} belum berubah pada OCR (${pending.attempts}/5). Menunggu frame berikutnya."
+                        scheduleVerificationPoll(900L)
+                    } else {
+                        pendingVerification = null
+                        executionManager?.confirmQuantity(
+                            itemName = item.name,
+                            observedCurrentQuantity = item.currentQuantity,
+                            observedRequiredQuantity = item.requiredQuantity
+                        )
+                    }
+                },
+                onFailure = { exception ->
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    isVerificationOcrRunning = false
+                    retryOrFailVerification("OCR gagal: ${exception.message ?: "kesalahan tidak diketahui"}")
+                }
+            )
+        } catch (exception: Exception) {
+            if (!bitmap.isRecycled) bitmap.recycle()
+            isVerificationOcrRunning = false
+            retryOrFailVerification("OCR gagal: ${exception.message ?: "kesalahan tidak diketahui"}")
+        }
+    }
+
+    private fun retryOrFailVerification(reason: String) {
+        val pending = pendingVerification ?: return
+        if (pending.attempts < 5) {
+            pending.attempts++
+            executionStatusText.text = "$reason Mencoba membaca frame baru (${pending.attempts}/5)."
+            scheduleVerificationPoll(900L)
+        } else {
+            pendingVerification = null
+            executionManager?.verificationFailed("Verifikasi tidak berhasil setelah beberapa frame. $reason Tidak ada drag ulang otomatis")
+        }
+    }
+
+    private fun normalizeItemName(value: String): String =
+        value.lowercase().filter { it.isLetterOrDigit() }
 
     private fun createHeading(text: String): TextView {
         return TextView(this).apply {
@@ -483,6 +1031,7 @@ class MainActivity : Activity() {
 
         val imageWidth = bitmap.width
         val imageHeight = bitmap.height
+        latestCaptureModifiedAtOcr = imageFile.lastModified()
 
         isOcrRunning = true
         statusText.text = "Sedang membaca teks dan mencari lokasi barang..."
@@ -507,6 +1056,11 @@ class MainActivity : Activity() {
                         imageWidth = imageWidth,
                         imageHeight = imageHeight
                     )
+
+                    latestParsedOrder = parsed
+                    latestDetection = detection
+                    latestImageWidth = imageWidth
+                    latestImageHeight = imageHeight
 
                     // Buat salinan gambar untuk menggambar penanda.
                     val annotatedBitmap = createDetectionOverlay(
@@ -684,7 +1238,10 @@ class MainActivity : Activity() {
                 "Lingkaran hijau menandai perkiraan posisi gambar produk berdasarkan label OCR."
             )
             appendLine(
-                "Periksa setiap lingkaran pada preview. Koordinat belum boleh digunakan untuk gesture otomatis sebelum divalidasi."
+                "Lingkaran biru menandai perkiraan titik tujuan pada kantong plastik."
+            )
+            appendLine(
+                "Periksa kedua jenis penanda pada preview. Koordinat hanya boleh diuji setelah kamu menyatakan sudah memeriksanya."
             )
         }
     }
@@ -846,10 +1403,52 @@ class MainActivity : Activity() {
             )
         }
 
+        // Penanda biru menunjukkan titik tujuan drag pada kantong plastik.
+        // Ini adalah kalibrasi awal dari screenshot pengguna, bukan titik final.
+        val bagX = output.width * TargetGameConfig.BAG_X_RATIO
+        val bagY = output.height * TargetGameConfig.BAG_Y_RATIO
+        val bagRadius = 78f * scale
+        val bagPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.CYAN
+            style = Paint.Style.STROKE
+            strokeWidth = 18f * scale
+        }
+        val bagFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(65, 0, 210, 255)
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(bagX, bagY, bagRadius, bagFill)
+        canvas.drawCircle(bagX, bagY, bagRadius, bagPaint)
+        canvas.drawLine(bagX - bagRadius, bagY, bagX + bagRadius, bagY, bagPaint)
+        canvas.drawLine(bagX, bagY - bagRadius, bagX, bagY + bagRadius, bagPaint)
+
+        val bagLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 64f * scale
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        val bagLabel = "TARGET KANTONG"
+        val bagLabelWidth = bagLabelPaint.measureText(bagLabel)
+        val labelX = (bagX - bagLabelWidth / 2f).coerceIn(8f, output.width - bagLabelWidth - 8f)
+        val labelY = (bagY - bagRadius - 16f * scale).coerceAtLeast(72f * scale)
+        val bagLabelBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0, 95, 125) }
+        canvas.drawRoundRect(
+            RectF(labelX - 12f * scale, labelY - 58f * scale, labelX + bagLabelWidth + 12f * scale, labelY + 12f * scale),
+            12f * scale,
+            12f * scale,
+            bagLabelBg
+        )
+        canvas.drawText(bagLabel, labelX, labelY, bagLabelPaint)
+
         return output
     }
 
     override fun onDestroy() {
+        pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingStartRunnable = null
+        pendingVerification = null
+        executionManager?.stop()
+        executionManager = null
         textRecognizer?.close()
         textRecognizer = null
 
