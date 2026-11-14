@@ -15,8 +15,10 @@ object TargetGameConfig {
     const val BAG_X_RATIO: Float = 0.508f
     const val BAG_Y_RATIO: Float = 0.878f
 
-    const val HOLD_DURATION_MS: Long = 350L
-    const val DRAG_DURATION_MS: Long = 650L
+    // Durasi dipersingkat untuk mengurangi waktu per item. Tetap cukup lama
+    // agar game menerima fase tekan dan perpindahan; validasi satu item dulu.
+    const val HOLD_DURATION_MS: Long = 220L
+    const val DRAG_DURATION_MS: Long = 350L
 
     val isConfigured: Boolean
         get() = TARGET_GAME_PACKAGE.isNotBlank()
