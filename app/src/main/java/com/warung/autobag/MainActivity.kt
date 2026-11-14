@@ -44,13 +44,13 @@ class MainActivity : Activity() {
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REFERENCE_IMAGE_WIDTH = 2304f
         private const val MAX_VERIFICATION_ATTEMPTS = 3
-        private const val FIRST_VERIFICATION_DELAY_MS = 250L
+        private const val FIRST_VERIFICATION_DELAY_MS = 300L
         private const val GAME_SWITCH_DELAY_MS = 1_500L
-        private const val CONTINUOUS_MONITOR_INTERVAL_MS = 450L
-        private const val CONTINUOUS_IDLE_RETRY_MS = 700L
+        private const val CONTINUOUS_MONITOR_INTERVAL_MS = 300L
+        private const val CONTINUOUS_IDLE_RETRY_MS = 450L
         private const val CONTINUOUS_STABLE_FRAME_COUNT = 2
         private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 4
-        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 450L
+        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 300L
     }
 
     private lateinit var statusText: TextView
@@ -201,7 +201,7 @@ class MainActivity : Activity() {
         }
 
         calibrationCheckBox = CheckBox(this).apply {
-            text = "Saya sudah memeriksa titik hijau setiap barang dan titik biru kantong plastik pada preview."
+            text = "Saya sudah memeriksa titik hijau di tengah setiap produk pada preview."
             textSize = 13f
             setTextColor(Color.DKGRAY)
         }
@@ -244,7 +244,7 @@ class MainActivity : Activity() {
         }
 
         val automationNote = TextView(this).apply {
-            text = "Mode berkelanjutan memantau pelanggan baru secara otomatis. Capture harus tetap aktif. Periksa kalibrasi titik barang dan kantong sebelum mulai. Jika muncul interupsi, aplikasi menunggu panel kembali dan tidak mengulang drag secara buta."
+            text = "Mode berkelanjutan memantau pelanggan baru secara otomatis. Capture harus tetap aktif. Periksa titik hijau di tengah setiap produk sebelum mulai. Jika muncul interupsi, aplikasi menunggu panel kembali dan tidak mengulang tap secara buta."
             textSize = 12f
             setTextColor(Color.DKGRAY)
         }
@@ -297,14 +297,14 @@ class MainActivity : Activity() {
                 5. Biarkan Screen Capture tetap aktif.
                 6. Kembali ke aplikasi assistant melalui Recent Apps.
                 7. Tekan BACA PESANAN & DETEKSI LOKASI untuk pemeriksaan kalibrasi awal.
-                8. Periksa hasil OCR dan cocokkan penanda hijau dengan barang serta penanda biru dengan kantong plastik.
+                8. Periksa hasil OCR dan pastikan setiap penanda hijau berada di tengah gambar produk.
                 9. Centang konfirmasi kalibrasi.
                 10. Tekan MULAI MODE OTOMATIS BERKELANJUTAN.
                 11. Pindah ke game dalam 1,5 detik. Aplikasi akan memantau pelanggan berikutnya sampai STOP ditekan.
 
                 CATATAN PENTING:
-                - Titik hijau dan titik biru harus diperiksa sebelum mode otomatis dijalankan.
-                - Setiap drag harus dikonfirmasi melalui OCR baru.
+                - Titik hijau di tengah produk harus diperiksa sebelum mode otomatis dijalankan.
+                - Setiap tap harus dikonfirmasi melalui OCR baru.
                 - Jika interupsi muncul, selesaikan interupsi di game; aplikasi akan memeriksa panel kembali.
                 - Tombol STOP mengakhiri seluruh sesi otomatis.
             """.trimIndent()
@@ -361,20 +361,15 @@ class MainActivity : Activity() {
 
     private fun createExecutionManager() {
         executionManager = OrderExecutionManager(
-            dragDispatcher = OrderExecutionManager.DragDispatcher { source, destination, onComplete ->
+            tapDispatcher = OrderExecutionManager.TapDispatcher { source, onComplete ->
                 if (latestImageWidth <= 0 || latestImageHeight <= 0) {
                     onComplete(false, "Ukuran screenshot terakhir belum tersedia.")
                 } else {
-                    val bagPoint = OrderExecutionManager.PixelPoint(
-                        x = latestImageWidth * TargetGameConfig.BAG_X_RATIO,
-                        y = latestImageHeight * TargetGameConfig.BAG_Y_RATIO
-                    )
-
-                    GestureController.executeOneItemFromImage(
+                    GestureController.executeTapFromImage(
                         sourceImagePoint = GestureController.ScreenPoint(source.x, source.y),
-                        bagImagePoint = GestureController.ScreenPoint(bagPoint.x, bagPoint.y),
                         imageWidth = latestImageWidth,
                         imageHeight = latestImageHeight,
+                        durationMs = TargetGameConfig.TAP_DURATION_MS,
                         onComplete = onComplete
                     )
                 }
@@ -390,10 +385,10 @@ class MainActivity : Activity() {
                         lastServedCustomerSignature = activeCustomerSignature
                         autoPausedAwaitingPanel = false
                         if (continuousModeEnabled) {
-                            scheduleContinuousMonitor(350L)
+                            scheduleContinuousMonitor(250L)
                         }
                     } else if (snapshot.state == OrderExecutionManager.State.PAUSED && continuousModeEnabled) {
-                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(450L)
+                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(300L)
                     } else if (snapshot.state == OrderExecutionManager.State.FAILED && continuousModeEnabled) {
                         scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
                     }
@@ -406,7 +401,7 @@ class MainActivity : Activity() {
                                     appendLine("Item aktif: ${snapshot.currentItem}")
                                     appendLine("Progres: ${snapshot.currentQuantity}/${snapshot.requiredQuantity}")
                                 }
-                                append("Jenis pesanan selesai: ${snapshot.completedOrderTypes}/${snapshot.totalOrderTypes}; gesture terkirim: ${snapshot.dispatchedGestures}")
+                                append("Jenis pesanan selesai: ${snapshot.completedOrderTypes}/${snapshot.totalOrderTypes}; tap terkirim: ${snapshot.dispatchedTaps}")
                             }
                         }
                     }
@@ -455,7 +450,7 @@ class MainActivity : Activity() {
             else -> Unit
         }
         if (!calibrationCheckBox.isChecked) {
-            executionStatusText.text = "Periksa titik hijau barang dan titik biru kantong, lalu centang konfirmasi kalibrasi."
+            executionStatusText.text = "Periksa apakah titik hijau berada di tengah produk, lalu centang konfirmasi kalibrasi."
             return
         }
         if (latestDetection == null || latestImageWidth <= 0 || latestImageHeight <= 0) {
@@ -548,7 +543,7 @@ class MainActivity : Activity() {
         }
 
         if (state == OrderExecutionManager.State.PAUSED && (!autoPausedAwaitingPanel || userPaused)) {
-            scheduleContinuousMonitor(500L)
+            scheduleContinuousMonitor(350L)
             return
         }
 
@@ -649,7 +644,7 @@ class MainActivity : Activity() {
             }
 
             val waitingMessage = if (autoPausedAwaitingPanel) {
-                "Interupsi atau pergantian pelanggan terdeteksi. Menunggu panel PESANAN muncul kembali; tidak ada drag baru."
+                "Interupsi atau pergantian pelanggan terdeteksi. Menunggu panel PESANAN muncul kembali; tidak ada tap baru."
             } else {
                 "Menunggu pelanggan baru. Panel PESANAN belum terlihat."
             }
@@ -715,7 +710,7 @@ class MainActivity : Activity() {
             managerState == OrderExecutionManager.State.RUNNING ||
             managerState == OrderExecutionManager.State.WAITING_VERIFICATION
         ) {
-            scheduleContinuousMonitor(500L)
+            scheduleContinuousMonitor(350L)
             return
         }
 
@@ -813,11 +808,6 @@ class MainActivity : Activity() {
         activeCustomerLabel = extractCustomerLabel(result)
         lastServedCustomerSignature = null
         autoPausedAwaitingPanel = false
-
-        val bagPoint = OrderExecutionManager.PixelPoint(
-            imageWidth * TargetGameConfig.BAG_X_RATIO,
-            imageHeight * TargetGameConfig.BAG_Y_RATIO
-        )
         runOnUiThread {
             if (!isFinishing && !isDestroyed) {
                 orderResultText.text = buildOrderOutput(parsed)
@@ -829,7 +819,7 @@ class MainActivity : Activity() {
                 ocrResultText.text = buildRawOcrOutput(result)
                 executionStatusText.text =
                     "Pelanggan baru terdeteksi: ${tasks.size} jenis pesanan. Memulai eksekusi otomatis."
-                executionManager?.start(tasks, bagPoint)
+                executionManager?.start(tasks)
             }
         }
     }
@@ -893,7 +883,7 @@ class MainActivity : Activity() {
             else -> Unit
         }
         if (!calibrationCheckBox.isChecked) {
-            executionStatusText.text = "Centang konfirmasi setelah memeriksa titik hijau dan titik biru pada preview."
+            executionStatusText.text = "Centang konfirmasi setelah memeriksa titik hijau di tengah setiap produk pada preview."
             return
         }
         if (!ScreenCaptureService.isRunning) {
@@ -974,7 +964,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Konfirmasi $mode")
             .setMessage(
-                "$description\n\nKoordinat barang dan kantong plastik masih berdasarkan kalibrasi visual awal. Setelah menekan MULAI, pindah kembali ke Warung Life Simulator dalam 1,5 detik. Capture harus tetap aktif."
+                "$description\n\nKoordinat titik produk masih berdasarkan kalibrasi visual awal. Setelah menekan MULAI, pindah kembali ke Warung Life Simulator dalam 1,5 detik. Capture harus tetap aktif."
             )
             .setNegativeButton("BATAL", null)
             .setPositiveButton("MULAI") { _, _ ->
@@ -1062,12 +1052,7 @@ class MainActivity : Activity() {
                         executionStatusText.text = "Tidak ada item yang masih perlu diambil pada panel terbaru."
                         return@recognize
                     }
-
-                    val bagPoint = OrderExecutionManager.PixelPoint(
-                        latestImageWidth * TargetGameConfig.BAG_X_RATIO,
-                        latestImageHeight * TargetGameConfig.BAG_Y_RATIO
-                    )
-                    executionManager?.start(tasks, bagPoint)
+                    executionManager?.start(tasks)
                 },
                 onFailure = { exception ->
                     if (!bitmap.isRecycled) bitmap.recycle()
@@ -1165,7 +1150,7 @@ class MainActivity : Activity() {
             attempts = 0,
             lastCaptureModified = if (captureFile.exists()) captureFile.lastModified() else 0L
         )
-        executionStatusText.text = "Drag $itemName dikirim. Memeriksa perubahan jumlah pada panel pesanan..."
+        executionStatusText.text = "Tap $itemName dikirim. Memeriksa perubahan jumlah pada panel pesanan..."
         scheduleVerificationPoll(FIRST_VERIFICATION_DELAY_MS)
     }
 
@@ -1439,20 +1424,20 @@ class MainActivity : Activity() {
         }
 
         // Keep the verification checkpoint. When the same panel returns,
-        // resume() requests a fresh OCR verification; it does not re-drag.
+        // resume() requests a fresh OCR verification; it does not re-tap.
         autoPausedAwaitingPanel = true
         executionManager?.verificationFailed(
             "$reason Antrean dijeda sementara tanpa mengirim ulang gesture."
         )
         executionStatusText.text =
             "$reason Menunggu panel kembali atau pelanggan baru terdeteksi."
-        scheduleContinuousMonitor(350L)
+        scheduleContinuousMonitor(250L)
     }
 
     private fun verificationRetryDelay(retryNumber: Int): Long = when (retryNumber) {
-        1 -> 350L
-        2 -> 500L
-        else -> 500L
+        1 -> 250L
+        2 -> 350L
+        else -> 350L
     }
 
     private fun retryOrFailVerification(reason: String) {
@@ -1468,7 +1453,7 @@ class MainActivity : Activity() {
         } else {
             pendingVerification = null
             executionManager?.verificationFailed(
-                "Verifikasi tidak berhasil setelah $MAX_VERIFICATION_ATTEMPTS frame. $reason Tidak ada drag ulang otomatis"
+                "Verifikasi tidak berhasil setelah $MAX_VERIFICATION_ATTEMPTS frame. $reason Tidak ada tap ulang otomatis"
             )
         }
     }
@@ -1965,13 +1950,13 @@ class MainActivity : Activity() {
 
             appendLine("CATATAN VALIDASI")
             appendLine(
-                "Lingkaran hijau menandai perkiraan posisi gambar produk berdasarkan label OCR."
+                "Lingkaran hijau menandai titik tap pada produk berdasarkan label OCR."
             )
             appendLine(
-                "Lingkaran biru menandai perkiraan titik tujuan pada kantong plastik."
+                "Produk yang diketuk akan dimasukkan otomatis ke kantong oleh mekanisme game."
             )
             appendLine(
-                "Periksa kedua jenis penanda pada preview. Koordinat hanya boleh diuji setelah kamu menyatakan sudah memeriksanya."
+                "Periksa setiap penanda hijau dan pastikan berada di tengah produk. Koordinat hanya boleh diuji setelah kamu menyatakan sudah memeriksanya."
             )
         }
     }
@@ -2133,42 +2118,7 @@ class MainActivity : Activity() {
             )
         }
 
-        // Penanda biru menunjukkan titik tujuan drag pada kantong plastik.
-        // Ini adalah kalibrasi awal dari screenshot pengguna, bukan titik final.
-        val bagX = output.width * TargetGameConfig.BAG_X_RATIO
-        val bagY = output.height * TargetGameConfig.BAG_Y_RATIO
-        val bagRadius = 78f * scale
-        val bagPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.CYAN
-            style = Paint.Style.STROKE
-            strokeWidth = 18f * scale
-        }
-        val bagFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(65, 0, 210, 255)
-            style = Paint.Style.FILL
-        }
-        canvas.drawCircle(bagX, bagY, bagRadius, bagFill)
-        canvas.drawCircle(bagX, bagY, bagRadius, bagPaint)
-        canvas.drawLine(bagX - bagRadius, bagY, bagX + bagRadius, bagY, bagPaint)
-        canvas.drawLine(bagX, bagY - bagRadius, bagX, bagY + bagRadius, bagPaint)
-
-        val bagLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = 64f * scale
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-        }
-        val bagLabel = "TARGET KANTONG"
-        val bagLabelWidth = bagLabelPaint.measureText(bagLabel)
-        val labelX = (bagX - bagLabelWidth / 2f).coerceIn(8f, output.width - bagLabelWidth - 8f)
-        val labelY = (bagY - bagRadius - 16f * scale).coerceAtLeast(72f * scale)
-        val bagLabelBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0, 95, 125) }
-        canvas.drawRoundRect(
-            RectF(labelX - 12f * scale, labelY - 58f * scale, labelX + bagLabelWidth + 12f * scale, labelY + 12f * scale),
-            12f * scale,
-            12f * scale,
-            bagLabelBg
-        )
-        canvas.drawText(bagLabel, labelX, labelY, bagLabelPaint)
+        // Tap-to-bag tidak memerlukan titik tujuan kantong.
 
         return output
     }
