@@ -46,6 +46,11 @@ class MainActivity : Activity() {
         private const val MAX_VERIFICATION_ATTEMPTS = 3
         private const val FIRST_VERIFICATION_DELAY_MS = 250L
         private const val GAME_SWITCH_DELAY_MS = 1_500L
+        private const val CONTINUOUS_MONITOR_INTERVAL_MS = 450L
+        private const val CONTINUOUS_IDLE_RETRY_MS = 700L
+        private const val CONTINUOUS_STABLE_FRAME_COUNT = 2
+        private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 4
+        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 450L
     }
 
     private lateinit var statusText: TextView
@@ -71,6 +76,20 @@ class MainActivity : Activity() {
     private var verificationRegion: Rect? = null
     private var pendingVerification: PendingVerification? = null
     private var pendingStartRunnable: Runnable? = null
+
+    // Continuous customer monitoring state.
+    private var continuousModeEnabled = false
+    private var continuousMonitorRunnable: Runnable? = null
+    private var continuousScanInFlight = false
+    private var lastContinuousFrameModifiedAt = 0L
+    private var candidateCustomerSignature: String? = null
+    private var candidateStableFrameCount = 0
+    private var panelAbsentFrameCount = 0
+    private var activeCustomerSignature: String? = null
+    private var activeCustomerLabel: String? = null
+    private var lastServedCustomerSignature: String? = null
+    private var autoPausedAwaitingPanel = false
+    private var userPaused = false
 
     private data class PendingVerification(
         val itemName: String,
@@ -171,7 +190,7 @@ class MainActivity : Activity() {
             }
         }
 
-        val automationHeading = createHeading("GESTURE AUTOMATION — TAHAP UJI")
+        val automationHeading = createHeading("GESTURE AUTOMATION — MODE BERKELANJUTAN")
 
         executionStatusText = TextView(this).apply {
             text = "Status: otomatisasi belum dijalankan."
@@ -193,16 +212,18 @@ class MainActivity : Activity() {
         }
 
         val startAutomaticButton = Button(this).apply {
-            text = "MULAI OTOMATIS — SEMUA PESANAN"
-            setOnClickListener { prepareAutomaticExecution(singleItemOnly = false) }
+            text = "MULAI MODE OTOMATIS BERKELANJUTAN"
+            setOnClickListener { prepareContinuousMode() }
         }
 
         val pauseAutomaticButton = Button(this).apply {
             text = "PAUSE"
             setOnClickListener {
+                userPaused = true
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
                 pendingStartRunnable = null
                 executionManager?.pause()
+                executionStatusText.text = "PAUSE diminta. Mode otomatis menunggu perintah LANJUTKAN."
             }
         }
 
@@ -214,16 +235,16 @@ class MainActivity : Activity() {
         val stopAutomaticButton = Button(this).apply {
             text = "STOP"
             setOnClickListener {
+                stopContinuousMode()
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
                 pendingStartRunnable = null
-                pendingVerification = null
-                ScreenCaptureService.setAutomationActive(false)
                 executionManager?.stop()
+                executionStatusText.text = "Mode otomatis dihentikan. Tidak ada pelanggan berikutnya yang akan diproses."
             }
         }
 
         val automationNote = TextView(this).apply {
-            text = "Capture harus tetap aktif selama otomatisasi agar setiap drag dapat diverifikasi dengan OCR. Setelah menekan MULAI, pindah kembali ke game dalam 1,5 detik. Jika panel pesanan tidak terbaca atau muncul interupsi, antrean akan dijeda tanpa mengulang drag secara buta."
+            text = "Mode berkelanjutan memantau pelanggan baru secara otomatis. Capture harus tetap aktif. Periksa kalibrasi titik barang dan kantong sebelum mulai. Jika muncul interupsi, aplikasi menunggu panel kembali dan tidak mengulang drag secara buta."
             textSize = 12f
             setTextColor(Color.DKGRAY)
         }
@@ -275,17 +296,17 @@ class MainActivity : Activity() {
                 4. Tunggu sampai papan pesanan pelanggan terlihat.
                 5. Biarkan Screen Capture tetap aktif.
                 6. Kembali ke aplikasi assistant melalui Recent Apps.
-                7. Tekan BACA PESANAN & DETEKSI LOKASI.
-                8. Periksa daftar pesanan dan penanda hijau pada preview.
-                9. Cocokkan penanda hijau dengan gambar barang dan penanda biru dengan kantong plastik.
-                10. Centang konfirmasi kalibrasi, lalu tekan UJI GESTURE — 1 BARANG.
-                11. Pindah ke game dalam 1,5 detik dan amati hasilnya.
+                7. Tekan BACA PESANAN & DETEKSI LOKASI untuk pemeriksaan kalibrasi awal.
+                8. Periksa hasil OCR dan cocokkan penanda hijau dengan barang serta penanda biru dengan kantong plastik.
+                9. Centang konfirmasi kalibrasi.
+                10. Tekan MULAI MODE OTOMATIS BERKELANJUTAN.
+                11. Pindah ke game dalam 1,5 detik. Aplikasi akan memantau pelanggan berikutnya sampai STOP ditekan.
 
                 CATATAN PENTING:
-                - Titik hijau masih merupakan estimasi posisi produk.
-                - Titik biru kantong plastik juga merupakan kalibrasi awal.
-                - Otomatisasi hanya boleh dimulai setelah kedua titik diperiksa.
-                - Setiap drag harus dikonfirmasi melalui pembacaan OCR baru.
+                - Titik hijau dan titik biru harus diperiksa sebelum mode otomatis dijalankan.
+                - Setiap drag harus dikonfirmasi melalui OCR baru.
+                - Jika interupsi muncul, selesaikan interupsi di game; aplikasi akan memeriksa panel kembali.
+                - Tombol STOP mengakhiri seluruh sesi otomatis.
             """.trimIndent()
             textSize = 13f
             setTextColor(Color.DKGRAY)
@@ -361,9 +382,21 @@ class MainActivity : Activity() {
             listener = object : OrderExecutionManager.Listener {
                 override fun onStateChanged(snapshot: OrderExecutionManager.Snapshot) {
                     ScreenCaptureService.setAutomationActive(
-                        snapshot.state == OrderExecutionManager.State.RUNNING ||
+                        continuousModeEnabled ||
+                            snapshot.state == OrderExecutionManager.State.RUNNING ||
                             snapshot.state == OrderExecutionManager.State.WAITING_VERIFICATION
                     )
+                    if (snapshot.state == OrderExecutionManager.State.COMPLETED) {
+                        lastServedCustomerSignature = activeCustomerSignature
+                        autoPausedAwaitingPanel = false
+                        if (continuousModeEnabled) {
+                            scheduleContinuousMonitor(350L)
+                        }
+                    } else if (snapshot.state == OrderExecutionManager.State.PAUSED && continuousModeEnabled) {
+                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(450L)
+                    } else if (snapshot.state == OrderExecutionManager.State.FAILED && continuousModeEnabled) {
+                        scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                    }
                     runOnUiThread {
                         if (!isFinishing && !isDestroyed && ::executionStatusText.isInitialized) {
                             executionStatusText.text = buildString {
@@ -398,7 +431,454 @@ class MainActivity : Activity() {
         )
     }
 
+
+    /**
+     * Starts one continuous session. Unlike the one-shot test button, this
+     * mode discovers each new customer and creates a fresh queue automatically.
+     */
+    private fun prepareContinuousMode() {
+        if (continuousModeEnabled) {
+            executionStatusText.text = "Mode otomatis berkelanjutan sudah aktif. Gunakan PAUSE atau STOP."
+            return
+        }
+        if (isOcrRunning || isVerificationOcrRunning || continuousScanInFlight) {
+            executionStatusText.text = "OCR sedang berjalan. Tunggu sampai proses selesai."
+            return
+        }
+        when (executionManager?.state) {
+            OrderExecutionManager.State.RUNNING,
+            OrderExecutionManager.State.WAITING_VERIFICATION,
+            OrderExecutionManager.State.PAUSED -> {
+                executionStatusText.text = "Masih ada antrean sebelumnya. Selesaikan, LANJUTKAN, atau STOP sebelum memulai sesi baru."
+                return
+            }
+            else -> Unit
+        }
+        if (!calibrationCheckBox.isChecked) {
+            executionStatusText.text = "Periksa titik hijau barang dan titik biru kantong, lalu centang konfirmasi kalibrasi."
+            return
+        }
+        if (latestDetection == null || latestImageWidth <= 0 || latestImageHeight <= 0) {
+            executionStatusText.text = "Lakukan BACA PESANAN & DETEKSI LOKASI minimal sekali untuk memeriksa kalibrasi awal."
+            return
+        }
+        if (!ScreenCaptureService.isRunning) {
+            executionStatusText.text = "Screen Capture belum aktif. Aktifkan terlebih dahulu."
+            return
+        }
+        if (GestureAccessibilityService.instance == null) {
+            executionStatusText.text = "Gesture Accessibility Service belum aktif."
+            return
+        }
+        if (!TargetGameConfig.isConfigured) {
+            executionStatusText.text = "Package game belum dikonfigurasi. Mode otomatis tidak dapat dimulai."
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Mulai mode otomatis berkelanjutan")
+            .setMessage(
+                "Aplikasi akan memantau panel PESANAN, membaca pelanggan baru, mendeteksi lokasi barang, lalu menyelesaikan pesanan satu per satu. Setelah menekan MULAI, pindah ke game dalam 1,5 detik. Mode tetap aktif sampai kamu menekan STOP.\n\nPastikan kalibrasi barang dan kantong sudah diperiksa."
+            )
+            .setNegativeButton("BATAL", null)
+            .setPositiveButton("MULAI") { _, _ ->
+                continuousModeEnabled = true
+                userPaused = false
+                autoPausedAwaitingPanel = false
+                pendingVerification = null
+                activeCustomerSignature = null
+                activeCustomerLabel = null
+                lastServedCustomerSignature = null
+                candidateCustomerSignature = null
+                candidateStableFrameCount = 0
+                panelAbsentFrameCount = 0
+                lastContinuousFrameModifiedAt = 0L
+                ScreenCaptureService.setAutomationActive(true)
+                executionStatusText.text =
+                    "MODE BERKELANJUTAN AKTIF. Pindah ke game; sistem mulai memantau pelanggan."
+                scheduleContinuousMonitor(GAME_SWITCH_DELAY_MS)
+            }
+            .show()
+    }
+
+    private fun scheduleContinuousMonitor(delayMs: Long = CONTINUOUS_MONITOR_INTERVAL_MS) {
+        if (!continuousModeEnabled) return
+        continuousMonitorRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            continuousMonitorRunnable = null
+            runContinuousMonitor()
+        }
+        continuousMonitorRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
+    }
+
+    private fun runContinuousMonitor() {
+        if (!continuousModeEnabled) return
+        if (userPaused) {
+            executionStatusText.text = "MODE BERKELANJUTAN DIJEDA PENGGUNA. Tekan LANJUTKAN untuk meneruskan pemantauan."
+            scheduleContinuousMonitor(700L)
+            return
+        }
+
+        if (!ScreenCaptureService.isRunning) {
+            executionStatusText.text =
+                "MODE BERKELANJUTAN MENUNGGU: Screen Capture tidak aktif. Aktifkan kembali capture."
+            scheduleContinuousMonitor(1_000L)
+            return
+        }
+
+        val accessibility = GestureAccessibilityService.instance
+        if (accessibility == null || !accessibility.isTargetGameForeground()) {
+            executionStatusText.text =
+                "MODE BERKELANJUTAN MENUNGGU: buka Warung Life Simulator agar panel pelanggan dapat dipantau."
+            scheduleContinuousMonitor(800L)
+            return
+        }
+
+        val state = executionManager?.state
+        if (
+            state == OrderExecutionManager.State.RUNNING ||
+            state == OrderExecutionManager.State.WAITING_VERIFICATION ||
+            isOcrRunning ||
+            isVerificationOcrRunning ||
+            continuousScanInFlight
+        ) {
+            scheduleContinuousMonitor(250L)
+            return
+        }
+
+        if (state == OrderExecutionManager.State.PAUSED && (!autoPausedAwaitingPanel || userPaused)) {
+            scheduleContinuousMonitor(500L)
+            return
+        }
+
+        val imageFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
+        if (!imageFile.exists()) {
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        val modifiedAt = imageFile.lastModified()
+        if (modifiedAt <= lastContinuousFrameModifiedAt) {
+            scheduleContinuousMonitor(250L)
+            return
+        }
+        lastContinuousFrameModifiedAt = modifiedAt
+
+        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+        if (bitmap == null) {
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        continuousScanInFlight = true
+        isOcrRunning = true
+        val imageWidth = bitmap.width
+        val imageHeight = bitmap.height
+        val recognizer = textRecognizer
+            ?: OrderTextRecognizer().also { textRecognizer = it }
+
+        try {
+            recognizer.recognize(
+                bitmap = bitmap,
+                onSuccess = { result ->
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    continuousScanInFlight = false
+                    isOcrRunning = false
+                    if (!continuousModeEnabled) return@recognize
+
+                    val parsed = OrderParser.parse(result)
+                    runOnUiThread {
+                        if (!continuousModeEnabled || isFinishing || isDestroyed) {
+                            return@runOnUiThread
+                        }
+                        updateVerificationRegion(result, imageWidth, imageHeight)
+                        handleContinuousScanResult(
+                            result = result,
+                            parsed = parsed,
+                            imageWidth = imageWidth,
+                            imageHeight = imageHeight,
+                            captureModifiedAt = modifiedAt
+                        )
+                    }
+                },
+                onFailure = { exception ->
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    continuousScanInFlight = false
+                    isOcrRunning = false
+                    runOnUiThread {
+                        if (continuousModeEnabled) {
+                            executionStatusText.text =
+                                "Pemantauan pelanggan: OCR belum berhasil (${exception.message ?: "kesalahan tidak diketahui"}). Mencoba frame berikutnya."
+                            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                        }
+                    }
+                }
+            )
+        } catch (exception: Exception) {
+            if (!bitmap.isRecycled) bitmap.recycle()
+            continuousScanInFlight = false
+            isOcrRunning = false
+            runOnUiThread {
+                executionStatusText.text =
+                    "Pemantauan pelanggan mengalami kesalahan: ${exception.message ?: "tidak diketahui"}."
+                scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            }
+        }
+    }
+
+    private fun handleContinuousScanResult(
+        result: OcrResult,
+        parsed: OrderParseResult,
+        imageWidth: Int,
+        imageHeight: Int,
+        captureModifiedAt: Long
+    ) {
+        if (!parsed.headerFound || parsed.items.isEmpty()) {
+            panelAbsentFrameCount++
+            candidateCustomerSignature = null
+            candidateStableFrameCount = 0
+
+            if (
+                panelAbsentFrameCount >= CONTINUOUS_STABLE_FRAME_COUNT &&
+                executionManager?.state == OrderExecutionManager.State.COMPLETED
+            ) {
+                activeCustomerSignature = null
+                activeCustomerLabel = null
+                lastServedCustomerSignature = null
+            }
+
+            val waitingMessage = if (autoPausedAwaitingPanel) {
+                "Interupsi atau pergantian pelanggan terdeteksi. Menunggu panel PESANAN muncul kembali; tidak ada drag baru."
+            } else {
+                "Menunggu pelanggan baru. Panel PESANAN belum terlihat."
+            }
+            executionStatusText.text = waitingMessage
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        val hadStablePanelGap = panelAbsentFrameCount >= CONTINUOUS_STABLE_FRAME_COUNT
+        panelAbsentFrameCount = 0
+
+        val signature = createCustomerSignature(parsed)
+        if (signature.isBlank()) {
+            executionStatusText.text = "Panel terlihat, tetapi identitas item pesanan belum cukup jelas. Menunggu frame berikutnya."
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        if (candidateCustomerSignature == signature) {
+            candidateStableFrameCount++
+        } else {
+            candidateCustomerSignature = signature
+            candidateStableFrameCount = 1
+        }
+
+        if (candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT) {
+            executionStatusText.text =
+                "Panel pelanggan terdeteksi. Memastikan pesanan stabil (${candidateStableFrameCount}/${CONTINUOUS_STABLE_FRAME_COUNT})."
+            scheduleContinuousMonitor(250L)
+            return
+        }
+
+        val managerState = executionManager?.state
+
+        val detectedCustomerLabel = extractCustomerLabel(result)
+        val customerIdentityChanged =
+            activeCustomerLabel != null &&
+                detectedCustomerLabel != null &&
+                !activeCustomerLabel.equals(detectedCustomerLabel, ignoreCase = true)
+
+        if (managerState == OrderExecutionManager.State.PAUSED && autoPausedAwaitingPanel && !userPaused) {
+            if (signature == activeCustomerSignature && !customerIdentityChanged) {
+                autoPausedAwaitingPanel = false
+                executionStatusText.text =
+                    "Panel pelanggan yang sama kembali terdeteksi. Melanjutkan verifikasi sebelumnya."
+                executionManager?.resume()
+                scheduleContinuousMonitor(300L)
+                return
+            }
+
+            // A different order signature or customer label means the old
+            // customer has left. Discard its stale checkpoint before starting
+            // the new customer's queue.
+            executionManager?.stop()
+            pendingVerification = null
+            autoPausedAwaitingPanel = false
+            activeCustomerSignature = null
+            activeCustomerLabel = null
+            executionStatusText.text =
+                "Pelanggan baru terdeteksi. Antrean lama ditutup dan pesanan baru sedang disiapkan."
+        } else if (
+            managerState == OrderExecutionManager.State.PAUSED ||
+            managerState == OrderExecutionManager.State.RUNNING ||
+            managerState == OrderExecutionManager.State.WAITING_VERIFICATION
+        ) {
+            scheduleContinuousMonitor(500L)
+            return
+        }
+
+        if (
+            managerState == OrderExecutionManager.State.COMPLETED &&
+            signature == activeCustomerSignature &&
+            !customerIdentityChanged &&
+            !hadStablePanelGap
+        ) {
+            executionStatusText.text =
+                "Pesanan pelanggan ini sudah selesai. Menunggu pelanggan berikutnya."
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        if (
+            signature == lastServedCustomerSignature &&
+            !customerIdentityChanged &&
+            !hadStablePanelGap
+        ) {
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        startContinuousCustomerOrder(
+            result = result,
+            parsed = parsed,
+            signature = signature,
+            imageWidth = imageWidth,
+            imageHeight = imageHeight,
+            captureModifiedAt = captureModifiedAt
+        )
+    }
+
+    private fun startContinuousCustomerOrder(
+        result: OcrResult,
+        parsed: OrderParseResult,
+        signature: String,
+        imageWidth: Int,
+        imageHeight: Int,
+        captureModifiedAt: Long
+    ) {
+        val pendingOrders = parsed.items.filter { order ->
+            val current = order.currentQuantity
+            val required = order.requiredQuantity
+            current != null && required != null && current < required
+        }
+
+        if (pendingOrders.isEmpty()) {
+            activeCustomerSignature = signature
+            activeCustomerLabel = extractCustomerLabel(result)
+            lastServedCustomerSignature = signature
+            latestParsedOrder = parsed
+            latestCaptureModifiedAtOcr = captureModifiedAt
+            executionStatusText.text =
+                "Panel pelanggan terdeteksi, tetapi seluruh jumlah pesanan sudah terpenuhi. Menunggu pelanggan berikutnya."
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        if (parsed.items.any { it.currentQuantity == null || it.requiredQuantity == null }) {
+            executionStatusText.text =
+                "Pesanan terdeteksi, tetapi jumlah salah satu item belum terbaca lengkap. Menunggu pembacaan ulang."
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        val detection = SmartItemDetector.detect(
+            ocrResult = result,
+            orders = parsed.items,
+            imageWidth = imageWidth,
+            imageHeight = imageHeight
+        )
+        val tasks = buildTasksFromSnapshot(parsed, detection, singleItemOnly = false)
+        if (tasks == null) {
+            executionStatusText.text =
+                "Pelanggan terdeteksi, tetapi lokasi satu atau lebih barang belum ditemukan. Sistem akan mencoba deteksi ulang; tidak ada gesture dikirim."
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+        if (tasks.isEmpty()) {
+            activeCustomerSignature = signature
+            activeCustomerLabel = extractCustomerLabel(result)
+            lastServedCustomerSignature = signature
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        latestParsedOrder = parsed
+        latestDetection = detection
+        latestImageWidth = imageWidth
+        latestImageHeight = imageHeight
+        latestCaptureModifiedAtOcr = captureModifiedAt
+        activeCustomerSignature = signature
+        activeCustomerLabel = extractCustomerLabel(result)
+        lastServedCustomerSignature = null
+        autoPausedAwaitingPanel = false
+
+        val bagPoint = OrderExecutionManager.PixelPoint(
+            imageWidth * TargetGameConfig.BAG_X_RATIO,
+            imageHeight * TargetGameConfig.BAG_Y_RATIO
+        )
+        runOnUiThread {
+            if (!isFinishing && !isDestroyed) {
+                orderResultText.text = buildOrderOutput(parsed)
+                detectionResultText.text = buildDetectionOutput(
+                    detection = detection,
+                    imageWidth = imageWidth,
+                    imageHeight = imageHeight
+                )
+                ocrResultText.text = buildRawOcrOutput(result)
+                executionStatusText.text =
+                    "Pelanggan baru terdeteksi: ${tasks.size} jenis pesanan. Memulai eksekusi otomatis."
+                executionManager?.start(tasks, bagPoint)
+            }
+        }
+    }
+
+    private fun createCustomerSignature(parsed: OrderParseResult): String =
+        parsed.items.joinToString("|") { item ->
+            "${normalizeItemName(item.name)}:${item.requiredQuantity ?: -1}"
+        }
+
+    private fun extractCustomerLabel(result: OcrResult): String? {
+        val ignored = setOf("pesanan", "reputasiwarung", "levelwarung")
+        return result.lines
+            .asSequence()
+            .map { it.text.trim() }
+            .firstOrNull { raw ->
+                val text = raw.removeSuffix(":").trim()
+                raw.endsWith(":") &&
+                    text.length in 4..32 &&
+                    text.any { it.isWhitespace() } &&
+                    normalizeItemName(text) !in ignored &&
+                    text.any { it.isLetter() }
+            }
+            ?.removeSuffix(":")
+            ?.trim()
+            ?.let(::normalizeItemName)
+    }
+
+    private fun stopContinuousMode() {
+        continuousModeEnabled = false
+        userPaused = false
+        autoPausedAwaitingPanel = false
+        activeCustomerSignature = null
+        activeCustomerLabel = null
+        lastServedCustomerSignature = null
+        candidateCustomerSignature = null
+        candidateStableFrameCount = 0
+        panelAbsentFrameCount = 0
+        lastContinuousFrameModifiedAt = 0L
+        continuousMonitorRunnable?.let { mainHandler.removeCallbacks(it) }
+        continuousMonitorRunnable = null
+        pendingVerification = null
+        ScreenCaptureService.setAutomationActive(false)
+    }
+
     private fun prepareAutomaticExecution(singleItemOnly: Boolean) {
+        if (continuousModeEnabled) {
+            executionStatusText.text = "Mode otomatis berkelanjutan sedang aktif. Tekan STOP sebelum menjalankan uji satu barang."
+            return
+        }
         if (isOcrRunning || isVerificationOcrRunning) {
             executionStatusText.text = "OCR sedang berjalan. Tunggu sampai selesai."
             return
@@ -638,21 +1118,32 @@ class MainActivity : Activity() {
 
     private fun scheduleResumeAfterGameSwitch() {
         val manager = executionManager
-        if (manager == null || manager.state != OrderExecutionManager.State.PAUSED) {
-            executionStatusText.text = "Tidak ada antrean yang sedang dijeda."
+        val hasPausedQueue = manager?.state == OrderExecutionManager.State.PAUSED
+
+        if (!hasPausedQueue && !(continuousModeEnabled && userPaused)) {
+            executionStatusText.text = "Tidak ada antrean atau pemantauan yang sedang dijeda."
             return
         }
+
         pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
         executionStatusText.text = "Lanjutkan dipersiapkan. Pindah ke game dalam 1,5 detik."
         val runnable = Runnable {
             pendingStartRunnable = null
             val accessibility = GestureAccessibilityService.instance
             if (accessibility == null || !accessibility.isTargetGameForeground()) {
-                executionStatusText.text = "Game belum terdeteksi di depan. Antrean tetap dijeda."
+                executionStatusText.text = "Game belum terdeteksi di depan. Proses tetap dijeda."
                 return@Runnable
             }
-            ScreenCaptureService.setAutomationActive(true)
-            manager.resume()
+
+            userPaused = false
+            if (hasPausedQueue) {
+                ScreenCaptureService.setAutomationActive(true)
+                manager?.resume()
+            } else {
+                executionStatusText.text = "Pemantauan pelanggan dilanjutkan."
+                ScreenCaptureService.setAutomationActive(true)
+                scheduleContinuousMonitor(250L)
+            }
         }
         pendingStartRunnable = runnable
         mainHandler.postDelayed(runnable, GAME_SWITCH_DELAY_MS)
@@ -869,10 +1360,17 @@ class MainActivity : Activity() {
         if (pendingVerification !== pending) return
 
         if (!parsed.headerFound || parsed.items.isEmpty()) {
-            executionManager?.verificationFailed(
-                "Panel PESANAN tidak terbaca. Kemungkinan ada interupsi atau pelanggan sedang berganti; selesaikan secara manual lalu tekan LANJUTKAN untuk memeriksa ulang"
-            )
-            pendingVerification = null
+            if (continuousModeEnabled) {
+                waitForContinuousPanel(
+                    pending,
+                    "Panel PESANAN sementara tidak terlihat. Mode otomatis menunggu panel kembali."
+                )
+            } else {
+                executionManager?.verificationFailed(
+                    "Panel PESANAN tidak terbaca. Kemungkinan ada interupsi atau pelanggan sedang berganti; selesaikan secara manual lalu tekan LANJUTKAN untuk memeriksa ulang"
+                )
+                pendingVerification = null
+            }
             return
         }
 
@@ -880,10 +1378,17 @@ class MainActivity : Activity() {
             normalizeItemName(it.name) == normalizeItemName(pending.itemName)
         }
         if (item == null) {
-            executionManager?.verificationFailed(
-                "Item ${pending.itemName} tidak ditemukan pada panel terbaru. Periksa kemungkinan pergantian pelanggan atau interupsi"
-            )
-            pendingVerification = null
+            if (continuousModeEnabled) {
+                waitForContinuousPanel(
+                    pending,
+                    "Item ${pending.itemName} tidak ditemukan pada panel terbaru. Memeriksa apakah pelanggan berganti atau interupsi masih berlangsung."
+                )
+            } else {
+                executionManager?.verificationFailed(
+                    "Item ${pending.itemName} tidak ditemukan pada panel terbaru. Periksa kemungkinan pergantian pelanggan atau interupsi"
+                )
+                pendingVerification = null
+            }
             return
         }
 
@@ -915,6 +1420,35 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun waitForContinuousPanel(
+        pending: PendingVerification,
+        reason: String
+    ) {
+        if (!continuousModeEnabled) {
+            pendingVerification = null
+            executionManager?.verificationFailed(reason)
+            return
+        }
+
+        if (pending.attempts < MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS) {
+            pending.attempts++
+            executionStatusText.text =
+                "$reason Percobaan pemantauan ${pending.attempts}/$MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS."
+            scheduleVerificationPoll(CONTINUOUS_PANEL_RETRY_DELAY_MS)
+            return
+        }
+
+        // Keep the verification checkpoint. When the same panel returns,
+        // resume() requests a fresh OCR verification; it does not re-drag.
+        autoPausedAwaitingPanel = true
+        executionManager?.verificationFailed(
+            "$reason Antrean dijeda sementara tanpa mengirim ulang gesture."
+        )
+        executionStatusText.text =
+            "$reason Menunggu panel kembali atau pelanggan baru terdeteksi."
+        scheduleContinuousMonitor(350L)
+    }
+
     private fun verificationRetryDelay(retryNumber: Int): Long = when (retryNumber) {
         1 -> 350L
         2 -> 500L
@@ -923,6 +1457,10 @@ class MainActivity : Activity() {
 
     private fun retryOrFailVerification(reason: String) {
         val pending = pendingVerification ?: return
+        if (continuousModeEnabled) {
+            waitForContinuousPanel(pending, reason)
+            return
+        }
         if (pending.attempts < MAX_VERIFICATION_ATTEMPTS - 1) {
             pending.attempts++
             executionStatusText.text = "$reason Mencoba membaca frame baru (${pending.attempts + 1}/$MAX_VERIFICATION_ATTEMPTS)."
@@ -1028,6 +1566,8 @@ class MainActivity : Activity() {
     }
 
     private fun stopScreenCapture() {
+        stopContinuousMode()
+        executionManager?.stop()
         val serviceIntent = Intent(
             this,
             ScreenCaptureService::class.java
@@ -1636,6 +2176,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingStartRunnable = null
+        stopContinuousMode()
         pendingVerification = null
         ScreenCaptureService.setAutomationActive(false)
         verificationRegion = null
