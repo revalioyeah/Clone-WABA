@@ -10,7 +10,9 @@ object TargetGameConfig {
         "com.neopawstudio.warunglife"
 
     // Tap singkat; keberhasilan tetap diverifikasi melalui perubahan jumlah OCR.
-    const val TAP_DURATION_MS: Long = 60L
+    const val TAP_DURATION_MS: Long = 55L
+    const val TAP_INTERVAL_MS: Long = 35L
+    const val MAX_TAPS_PER_BATCH: Int = 2
 
     // Durasi drag lama dipertahankan untuk kompatibilitas/fallback manual.
     const val HOLD_DURATION_MS: Long = 220L
