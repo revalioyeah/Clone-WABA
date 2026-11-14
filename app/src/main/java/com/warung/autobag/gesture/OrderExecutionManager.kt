@@ -1,4 +1,4 @@
-package com.warung.autobag.tap
+package com.warung.autobag.gesture
 
 /**
  * Coordinates one-item-at-a-time tap-to-bag order execution.
