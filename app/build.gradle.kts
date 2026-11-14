@@ -1,3 +1,4 @@
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -11,8 +12,8 @@ android {
         applicationId = "com.warung.autobag"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
 
     compileOptions {
@@ -26,6 +27,9 @@ android {
 }
 
 dependencies {
-    // Fondasi awal sengaja memakai Android SDK bawaan agar build pertama sederhana.
-    // ML Kit OCR akan ditambahkan pada tahap integrasi OCR.
+
+    // Google ML Kit Text Recognition v2
+    // Bundled Latin OCR model
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+
 }
