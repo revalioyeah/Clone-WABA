@@ -1,8 +1,11 @@
 package com.warung.autobag
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
+import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -21,6 +24,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.Settings
+import android.view.View
+import android.view.accessibility.AccessibilityManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -52,6 +58,7 @@ import java.io.File
 class MainActivity : Activity() {
 
     companion object {
+        private const val ACCESSIBILITY_SETUP_SHOWN = "accessibility_setup_shown"
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REQUEST_POST_NOTIFICATIONS = 3102
         private const val REFERENCE_IMAGE_WIDTH = 2304f
@@ -69,6 +76,8 @@ class MainActivity : Activity() {
         private const val PRODUCT_LOCATION_CACHE_TTL_MS = 10 * 60 * 1000L
     }
 
+    private lateinit var accessibilityStatusText: TextView
+    private lateinit var accessibilitySettingsButton: Button
     private lateinit var statusText: TextView
     private lateinit var previewImage: ImageView
     private lateinit var orderResultText: TextView
@@ -155,6 +164,16 @@ class MainActivity : Activity() {
             text = "Screen Capture, Smart Order Recognition & Item Detection\n\nAmbil gambar layar game, baca papan pesanan, lalu cari perkiraan lokasi barang pada rak."
             textSize = 15f
             setTextColor(Color.DKGRAY)
+        }
+
+        accessibilityStatusText = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.DKGRAY)
+        }
+
+        accessibilitySettingsButton = Button(this).apply {
+            text = "AKTIFKAN ACCESSIBILITY"
+            setOnClickListener { openAccessibilitySettings() }
         }
 
         val heading = createHeading("SCREEN CAPTURE CONTROL")
@@ -363,7 +382,9 @@ class MainActivity : Activity() {
         }
 
         page.addView(title, marginParams(8))
-        page.addView(subtitle, marginParams(24))
+        page.addView(subtitle, marginParams(12))
+        page.addView(accessibilityStatusText, marginParams(6))
+        page.addView(accessibilitySettingsButton, marginParams(12))
 
         page.addView(heading, marginParams(12))
         page.addView(statusText, marginParams(12))
@@ -411,6 +432,46 @@ class MainActivity : Activity() {
         createExecutionManager()
     }
 
+
+    override fun onResume() {
+        super.onResume()
+
+        val enabled = isGestureAccessibilityEnabled()
+        accessibilityStatusText.text = if (enabled) {
+            "Accessibility aktif."
+        } else {
+            "Accessibility belum aktif. Pilih Warung Auto Bag Assistant di pengaturan Android."
+        }
+        accessibilitySettingsButton.visibility = if (enabled) View.GONE else View.VISIBLE
+
+        val preferences = getPreferences(Context.MODE_PRIVATE)
+        if (!preferences.getBoolean(ACCESSIBILITY_SETUP_SHOWN, false)) {
+            preferences.edit().putBoolean(ACCESSIBILITY_SETUP_SHOWN, true).apply()
+            if (!enabled) openAccessibilitySettings()
+        }
+    }
+
+    private fun isGestureAccessibilityEnabled(): Boolean {
+        val manager = getSystemService(AccessibilityManager::class.java) ?: return false
+        val component = ComponentName(this, GestureAccessibilityService::class.java)
+        return manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .any { enabledService ->
+                val service = enabledService.resolveInfo.serviceInfo
+                ComponentName.createRelative(service.packageName, service.name) == component
+            }
+    }
+
+    private fun openAccessibilitySettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(
+                this,
+                "Buka Pengaturan Android, lalu pilih Accessibility.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
 
     private fun currentCatalogEntries(): List<com.warung.autobag.detection.CatalogEntry> {
         return catalogEntriesCache ?: DynamicItemCatalog.allEntries(this).also {
