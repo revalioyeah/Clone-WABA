@@ -13,8 +13,8 @@ object TargetGameConfig {
     const val TAP_DURATION_MS: Long = 55L
     const val TAP_INTERVAL_MS: Long = 35L
     const val ITEM_SWITCH_DELAY_MS: Long = 45L
-    const val MAX_TAPS_PER_BATCH: Int = 2
-    const val MAX_ITEM_TYPES_PER_SEQUENCE: Int = 2
+    const val MAX_TAPS_PER_BATCH: Int = 5
+    const val MAX_ITEM_TYPES_PER_SEQUENCE: Int = 8
 
     // Durasi drag lama dipertahankan untuk kompatibilitas/fallback manual.
     const val HOLD_DURATION_MS: Long = 220L
