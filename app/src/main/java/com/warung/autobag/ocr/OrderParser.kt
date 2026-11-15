@@ -45,7 +45,7 @@ object OrderParser {
     // pada screenshot dengan resolusi berbeda. Nilai 1,5 menjaga isi
     // kedua sisi panel tetap terbaca tanpa menjangkau rak kanan.
     private const val BOARD_HORIZONTAL_PADDING_RATIO = 1.5f
-    private const val BOARD_VERTICAL_RANGE = 250
+    private const val BOARD_VERTICAL_RANGE = 520
 
     // Jarak vertikal maksimum agar angka tidak dipasangkan
     // dengan barang pada baris yang terlalu jauh.
@@ -112,6 +112,12 @@ object OrderParser {
         val aliases: List<String>
     )
 
+    private data class CompiledCatalogAlias(
+        val canonicalName: String,
+        val pattern: Regex,
+        val aliasLength: Int
+    )
+
     /**
      * Katalog parser diselaraskan dengan ItemCatalog.
      * Alias diperlukan karena OCR dapat membaca nama paket data sebagai
@@ -130,6 +136,10 @@ object OrderParser {
         CatalogName("Buku tulis", listOf("Buku tulis")),
         CatalogName("Rengginang", listOf("Rengginang")),
         CatalogName("Teh celup", listOf("Teh celup", "Tehcelup")),
+        CatalogName("Minyak goreng", listOf("Minyak goreng", "Minyakgoreng")),
+        CatalogName("Sabun mandi", listOf("Sabun mandi", "Sabunmandi")),
+        CatalogName("Deterjen", listOf("Deterjen", "Detergen")),
+        CatalogName("Tisu", listOf("Tisu", "Tissue", "Tisu wajah")),
         CatalogName("Teh botol", listOf("Teh botol", "Tehbotol")),
         CatalogName("Kopi susu", listOf("Kopi susu", "Kopisusu")),
         CatalogName("Biskuit", listOf("Biskuit")),
@@ -151,6 +161,25 @@ object OrderParser {
         .sortedByDescending { entry ->
             entry.aliases.maxOf { normalize(it).length }
         }
+
+    // Compile catalog aliases once instead of rebuilding regex for every OCR line.
+    private val compiledCatalogAliases: List<CompiledCatalogAlias> =
+        catalogItems.flatMap { entry ->
+            entry.aliases.map { alias ->
+                val flexiblePattern = alias
+                    .trim()
+                    .split(Regex("""\s+"""))
+                    .joinToString("""\s+""") { Regex.escape(it) }
+
+                CompiledCatalogAlias(
+                    canonicalName = entry.canonicalName,
+                    pattern = Regex(
+                        """(?i)(?<![A-Z0-9])$flexiblePattern(?![A-Z0-9])"""
+                    ),
+                    aliasLength = normalize(alias).length
+                )
+            }
+        }.sortedByDescending { it.aliasLength }
 
     /**
      * Fungsi utama parsing papan pesanan.
@@ -302,30 +331,29 @@ object OrderParser {
         )
 
         // 6. Susun hasil dari atas ke bawah, lalu kiri ke kanan.
-        val sortedItems = itemFragments.sortedWith(
-            compareBy<ItemFragment> { it.box.centerY }
-                .thenBy { it.box.centerX }
-        )
-
-        val parsedItems = sortedItems.map { item ->
-
-            val itemIndex = itemFragments.indexOf(item)
-            val quantityIndex = assignments[itemIndex]
-            val quantity = quantityIndex?.let {
-                quantityFragments.getOrNull(it)
-            }
-
-            ParsedOrderItem(
-                name = item.name,
-                currentQuantity = quantity?.current,
-                requiredQuantity = quantity?.required,
-                rawText = if (quantity != null) {
-                    "${item.rawText} | ${quantity.rawText}"
-                } else {
-                    item.rawText
-                }
+        val parsedItems = itemFragments.withIndex()
+            .sortedWith(
+                compareBy<IndexedValue<ItemFragment>> { it.value.box.centerY }
+                    .thenBy { it.value.box.centerX }
             )
-        }
+            .map { indexedItem ->
+                val item = indexedItem.value
+                val quantityIndex = assignments[indexedItem.index]
+                val quantity = quantityIndex?.let {
+                    quantityFragments.getOrNull(it)
+                }
+
+                ParsedOrderItem(
+                    name = item.name,
+                    currentQuantity = quantity?.current,
+                    requiredQuantity = quantity?.required,
+                    rawText = if (quantity != null) {
+                        "${item.rawText} | ${quantity.rawText}"
+                    } else {
+                        item.rawText
+                    }
+                )
+            }
 
         return OrderParseResult(
             items = parsedItems,
@@ -474,36 +502,22 @@ object OrderParser {
 
         val found = mutableListOf<TextMatch>()
 
-        for (entry in catalogItems) {
-            for (alias in entry.aliases.sortedByDescending { normalize(it).length }) {
+        for (alias in compiledCatalogAliases) {
+            for (match in alias.pattern.findAll(text)) {
 
-                val flexiblePattern = alias
-                    .trim()
-                    .split(Regex("""\s+"""))
-                    .joinToString("""\s+""") {
-                        Regex.escape(it)
-                    }
-
-                val pattern = Regex(
-                    """(?i)(?<![A-Z0-9])$flexiblePattern(?![A-Z0-9])"""
+                val candidate = TextMatch(
+                    name = alias.canonicalName,
+                    start = match.range.first,
+                    endExclusive = match.range.last + 1
                 )
 
-                for (match in pattern.findAll(text)) {
+                val overlaps = found.any { existing ->
+                    candidate.start < existing.endExclusive &&
+                        candidate.endExclusive > existing.start
+                }
 
-                    val candidate = TextMatch(
-                        name = entry.canonicalName,
-                        start = match.range.first,
-                        endExclusive = match.range.last + 1
-                    )
-
-                    val overlaps = found.any { existing ->
-                        candidate.start < existing.endExclusive &&
-                            candidate.endExclusive > existing.start
-                    }
-
-                    if (!overlaps) {
-                        found.add(candidate)
-                    }
+                if (!overlaps) {
+                    found.add(candidate)
                 }
             }
         }
