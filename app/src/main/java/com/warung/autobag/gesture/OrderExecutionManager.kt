@@ -1,9 +1,9 @@
 package com.warung.autobag.gesture
 
 /**
- * Coordinates short tap sequences across a small group of different products.
+ * Coordinates a fast tap sequence across the products in one customer order.
  *
- * Each execution group contains at most MAX_ITEM_TYPES_PER_SEQUENCE product
+ * Each execution group contains up to MAX_ITEM_TYPES_PER_SEQUENCE product
  * types. The taps are sent sequentially without an OCR round-trip between
  * product types, then the whole group is verified from one fresh order-panel
  * OCR. A failed or ambiguous verification pauses the queue; it never retries
@@ -153,7 +153,7 @@ class OrderExecutionManager(
         }
 
         state = State.RUNNING
-        publish("Antrean dimulai. Maksimal dua jenis barang diproses berurutan sebelum satu kali verifikasi OCR.")
+        publish("Antrean dimulai. Hingga ${TargetGameConfig.MAX_ITEM_TYPES_PER_SEQUENCE} jenis barang diproses berurutan sebelum satu kali verifikasi OCR.")
         dispatchCurrentGroup()
     }
 
