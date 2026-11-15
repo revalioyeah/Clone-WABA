@@ -12,8 +12,8 @@ android {
         applicationId = "com.warung.autobag"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.3.13-npc-trial1"
+        versionCode = 14
+        versionName = "0.3.14-npc-trial2"
     }
 
     compileOptions {
