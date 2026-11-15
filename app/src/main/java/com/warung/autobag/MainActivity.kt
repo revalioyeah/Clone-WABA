@@ -353,7 +353,7 @@ class MainActivity : Activity() {
 
                 CATATAN PENTING:
                 - Titik hijau di tengah produk harus diperiksa sebelum mode otomatis dijalankan.
-                - Maksimal dua jenis barang diproses berurutan sebelum satu verifikasi OCR panel.
+                - Hingga ${TargetGameConfig.MAX_ITEM_TYPES_PER_SEQUENCE} jenis barang diproses berurutan sebelum satu verifikasi OCR panel.
                 - Jika jumlah salah satu barang tidak cocok, antrean dijeda dan tidak mengulang tap secara otomatis.
                 - Jika interupsi muncul saat urutan tap berjalan, tekan PAUSE; selesaikan interupsi di game, lalu LANJUTKAN untuk verifikasi ulang.
                 - Tombol STOP mengakhiri seluruh sesi otomatis.
@@ -1157,12 +1157,32 @@ class MainActivity : Activity() {
                 parsed.items.all { item ->
                     item.currentQuantity != null &&
                         item.requiredQuantity != null &&
-                        item.requiredQuantity > 0
+                        item.requiredQuantity > 0 &&
+                        item.currentQuantity in 0..item.requiredQuantity
                 }
+
+        // Fast-start a new order on its first complete OCR frame. The
+        // coordinates are still validated by buildTasksFromSnapshot before
+        // any tap is dispatched. Keep the two-frame guard for an unchanged
+        // panel so a completed customer's order is never replayed.
+        val completeNewOrder =
+            parsed.items.isNotEmpty() &&
+                parsed.items.all { item ->
+                    item.currentQuantity != null &&
+                        item.requiredQuantity != null &&
+                        item.requiredQuantity > 0 &&
+                        item.currentQuantity in 0..item.requiredQuantity
+                } &&
+                (
+                    activeCustomerSignature == null ||
+                        signature != activeCustomerSignature ||
+                        hadStablePanelGap
+                )
 
         if (
             candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT &&
-            !completeExpandedOrder
+            !completeExpandedOrder &&
+            !completeNewOrder
         ) {
             if (!fullBitmap.isRecycled) fullBitmap.recycle()
             continuousScanInFlight = false
