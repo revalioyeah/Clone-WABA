@@ -139,7 +139,13 @@ class MainActivity : Activity() {
         var lastFrame: Long,
         var castTapped: Boolean = false,
         var biteTapped: Boolean = false,
-        var displayedEnergy: Int? = null
+        var energy: Int? = null,
+        var energyFrame: Long = 0L,
+        var lastEnergyScan: Long = 0L,
+        var energyScanInFlight: Boolean = false,
+        var lastCastFrame: Long = 0L,
+        var finishFrame: Long = 0L,
+        var finishAttempts: Int = 0
     )
 
     private val fishingEnergyPattern = Regex(
@@ -935,107 +941,130 @@ class MainActivity : Activity() {
             scheduleFishingScan(session, CONTINUOUS_IDLE_RETRY_MS)
             return
         }
-        val top = (height * 0.065f).toInt()
-        val left = (width * 0.15f).toInt()
-        val panel = Bitmap.createBitmap(
-            (width * 0.64f).toInt(), (height * 0.37f).toInt(), Bitmap.Config.ARGB_8888
-        )
-        Canvas(panel).drawBitmap(frame, -left.toFloat(), -top.toFloat(), null)
-        // Isolate the white status text from trees and water in the background.
-        val statusLeft = (width * 0.33f).toInt() - left
-        val statusTop = (height * 0.347f).toInt() - top
-        val statusWidth = (width * 0.43f).toInt()
-        val statusHeight = (height * 0.066f).toInt()
-        val pixels = IntArray(statusWidth * statusHeight)
-        panel.getPixels(pixels, 0, statusWidth, statusLeft, statusTop, statusWidth, statusHeight)
-        for (index in pixels.indices) {
-            val color = pixels[index]
-            pixels[index] = if (
-                Color.red(color) > 207 && Color.green(color) > 207 && Color.blue(color) > 207
-            ) Color.BLACK else Color.WHITE
-        }
-        panel.setPixels(pixels, 0, statusWidth, statusLeft, statusTop, statusWidth, statusHeight)
-        val bite = findFishingBite(frame)
-        frame.recycle()
-
-        val recognizer = textRecognizer ?: OrderTextRecognizer().also { textRecognizer = it }
         try {
-            recognizer.recognize(
-                bitmap = panel,
-                onSuccess = { result ->
-                    panel.recycle()
-                    if (fishingSession !== session) return@recognize
-                    handleFishingFrame(session, result, width, height, top, bite, modified)
-                    scheduleFishingScan(session)
-                },
-                onFailure = {
-                    panel.recycle()
-                    scheduleFishingScan(session, CONTINUOUS_IDLE_RETRY_MS)
-                }
-            )
-        } catch (_: Exception) {
-            if (!panel.isRecycled) panel.recycle()
-            scheduleFishingScan(session, CONTINUOUS_IDLE_RETRY_MS)
+            handleFishingFrame(session, frame, modified)
+        } finally {
+            frame.recycle()
         }
+        scheduleFishingScan(session)
     }
 
-    private fun handleFishingFrame(
-        session: FishingSession,
-        result: OcrResult,
-        width: Int,
-        height: Int,
-        cropTop: Int,
-        bite: GestureController.ScreenPoint?,
-        captureModifiedAt: Long
-    ) {
-        if (!result.lines.any { normalizeItemName(it.text) == "memancingdisungai" }) return
-        val energy = result.lines.firstNotNullOfOrNull {
-            fishingEnergyPattern.find(it.text.trim())?.groupValues?.get(1)
-                ?.toIntOrNull()?.takeIf { value -> value in 0..100 }
-        } ?: return
-        if (energy < 20) {
-            stopFishing("Energi $energy%. Memancing otomatis berhenti.")
-            return
-        }
-        if (session.displayedEnergy != energy) {
-            session.displayedEnergy = energy
-            fishingStatus.text = "Memancing aktif · Energi $energy%"
-        }
-        if (System.currentTimeMillis() - captureModifiedAt !in 0L..450L ||
-            GestureAccessibilityService.instance?.isTargetGameForeground() != true
-        ) return
+    private fun handleFishingFrame(session: FishingSession, frame: Bitmap, frameTime: Long) {
+        if (System.currentTimeMillis() - frameTime !in 0L..350L) return
 
-        val statusLines = result.lines.filter { it.top + cropTop >= height * 0.33f }
-        val readyToCast = statusLines.any {
-            normalizeItemName(it.text).contains("untukmelemparkail")
-        }
-
-        if (bite == null && !readyToCast) {
-            if (statusLines.any { normalizeItemName(it.text).contains("tunggupelampung") }) {
-                session.castTapped = false
-                session.biteTapped = false
+        val width = frame.width
+        val height = frame.height
+        // Reference coordinates are proportional to the recorded 2340 × 1080 frame.
+        fun pixel(x: Int, y: Int): Int = frame.getPixel(x * width / 2340, y * height / 1080)
+        val hasFinishButton = isFishingGold(pixel(445, 410)) &&
+            isFishingGold(pixel(625, 410)) && isFishingGold(pixel(380, 695))
+        if (!hasFinishButton) {
+            if (session.finishFrame != 0L && frameTime - session.finishFrame >= 200L) {
+                stopFishing("Memancing selesai. Energi di bawah 20%.")
             }
             return
         }
 
-        val point = if (bite != null) {
-            if (session.biteTapped) return
-            session.castTapped = false
-            bite
-        } else {
-            if (session.castTapped) return
-            session.biteTapped = false
-            GestureController.ScreenPoint(width * 0.56f, height * 0.75f)
+        val bar = pixel(536, 296)
+        val barNext = pixel(554, 296)
+        val redBar = isFishingEnergyRed(bar) && isFishingEnergyRed(barNext)
+        if (redBar || (session.energy ?: 100) < 20 || session.finishFrame != 0L) {
+            if (session.finishAttempts >= 2 && frameTime - session.finishFrame >= 650L) {
+                stopFishing("Energi rendah. Tekan Selesai di game jika layar masih terbuka.")
+                return
+            }
+            if (session.finishFrame == 0L || frameTime - session.finishFrame >= 650L) {
+                val sent = tapFishingPoint(width * 0.23f, height * 0.385f, width, height)
+                if (sent) {
+                    session.finishFrame = frameTime
+                    session.finishAttempts++
+                    fishingStatus.text = "Energi di bawah 20% · Menutup mini game."
+                }
+            }
+            return
         }
 
-        val sent = GestureController.executeTapFromImage(
-            sourceImagePoint = point,
+        // The dark top of the vertical power meter appears only when ready to cast.
+        val readyToCast = listOf(pixel(1835, 594), pixel(1850, 594)).all {
+            Color.red(it) in 55..115 && Color.green(it) in 65..120 && Color.blue(it) in 55..115
+        }
+        val bite = if (readyToCast) null else findFishingBite(frame)
+        if (!readyToCast) session.castTapped = false
+        if (readyToCast) session.biteTapped = false
+
+        val energy = session.energy
+        if (energy != null && energy >= 20 && frameTime - session.energyFrame in 0L..1000L) {
+            if (bite != null && !session.biteTapped) {
+                session.biteTapped = tapFishingPoint(bite.x, bite.y, width, height)
+            } else if (readyToCast && !session.castTapped) {
+                if (tapFishingPoint(width * 0.56f, height * 0.75f, width, height)) {
+                    session.castTapped = true
+                    session.lastCastFrame = frameTime
+                    session.energy = null
+                }
+            }
+        }
+        readFishingEnergy(session, frame, frameTime)
+    }
+
+    private fun tapFishingPoint(x: Float, y: Float, width: Int, height: Int): Boolean =
+        GestureController.executeTapFromImage(
+            sourceImagePoint = GestureController.ScreenPoint(x, y),
             imageWidth = width,
             imageHeight = height,
             onComplete = { _, _ -> }
         )
-        if (sent) {
-            if (bite != null) session.biteTapped = true else session.castTapped = true
+
+    private fun isFishingGold(pixel: Int): Boolean =
+        Color.red(pixel) >= 225 && Color.green(pixel) in 175..235 && Color.blue(pixel) in 75..155
+
+    private fun isFishingEnergyRed(pixel: Int): Boolean =
+        Color.red(pixel) in 185..245 && Color.green(pixel) in 60..132 && Color.blue(pixel) in 45..125
+
+    private fun readFishingEnergy(session: FishingSession, frame: Bitmap, frameTime: Long) {
+        if (session.energyScanInFlight || frameTime - session.lastEnergyScan < 200L ||
+            (session.lastCastFrame != 0L && frameTime - session.lastCastFrame < 200L)
+        ) return
+
+        val width = frame.width
+        val height = frame.height
+        val energyBounds = Rect(
+            width * 390 / 2340, height * 277 / 1080,
+            width * 516 / 2340, height * 315 / 1080
+        )
+        val crop = Bitmap.createBitmap(252, 76, Bitmap.Config.ARGB_8888)
+        Canvas(crop).drawBitmap(
+            frame, energyBounds, Rect(0, 0, crop.width, crop.height),
+            Paint(Paint.FILTER_BITMAP_FLAG)
+        )
+        session.energyScanInFlight = true
+        session.lastEnergyScan = frameTime
+        val recognizer = textRecognizer ?: OrderTextRecognizer().also { textRecognizer = it }
+        try {
+            recognizer.recognize(
+                bitmap = crop,
+                onSuccess = { result ->
+                    crop.recycle()
+                    session.energyScanInFlight = false
+                    if (fishingSession !== session || frameTime <= session.lastCastFrame) return@recognize
+                    val energy = result.lines.firstNotNullOfOrNull {
+                        fishingEnergyPattern.find(it.text.trim())?.groupValues?.get(1)
+                            ?.toIntOrNull()?.takeIf { value -> value in 0..100 }
+                    } ?: return@recognize
+                    if (session.energy != energy && session.finishFrame == 0L) {
+                        fishingStatus.text = "Memancing aktif · Energi $energy%"
+                    }
+                    session.energy = energy
+                    session.energyFrame = frameTime
+                },
+                onFailure = {
+                    crop.recycle()
+                    session.energyScanInFlight = false
+                }
+            )
+        } catch (_: Exception) {
+            if (!crop.isRecycled) crop.recycle()
+            session.energyScanInFlight = false
         }
     }
 
@@ -1047,9 +1076,7 @@ class MainActivity : Activity() {
         val up = (height * 0.012f).toInt()
         val down = (height * 0.016f).toInt()
         fun isGold(x: Int, y: Int): Boolean {
-            val pixel = frame.getPixel(x, y)
-            return Color.red(pixel) >= 225 && Color.green(pixel) in 175..235 &&
-                Color.blue(pixel) in 75..155
+            return isFishingGold(frame.getPixel(x, y))
         }
         for (y in (height * 0.46f).toInt()..(height * 0.80f).toInt() step step) {
             for (x in (width * 0.29f).toInt()..(width * 0.75f).toInt() step step) {
