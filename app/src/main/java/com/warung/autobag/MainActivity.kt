@@ -141,15 +141,15 @@ class MainActivity : Activity() {
         var biteTapped: Boolean = false,
         var energy: Int? = null,
         var energyFrame: Long = 0L,
-        var lastEnergyScan: Long = 0L,
         var energyScanInFlight: Boolean = false,
+        var lastEnergyScan: Long = 0L,
         var lastCastFrame: Long = 0L,
         var finishFrame: Long = 0L,
         var finishAttempts: Int = 0
     )
 
     private val fishingEnergyPattern = Regex(
-        """^ENERG[I1L!]\s*(\d{1,3})\s*%""", RegexOption.IGNORE_CASE
+        """^ENERG[I1L!|]\s*:?\s*(\d{1,3})\s*%""", RegexOption.IGNORE_CASE
     )
     private var debtTapAttempted = false
     private var debtDialogClearFrames = 0
@@ -984,23 +984,37 @@ class MainActivity : Activity() {
             return
         }
 
-        // The dark top of the vertical power meter appears only when ready to cast.
-        val readyToCast = listOf(pixel(1835, 594), pixel(1850, 594)).all {
-            Color.red(it) in 55..115 && Color.green(it) in 65..120 && Color.blue(it) in 55..115
+        // The meter edge stays bright in daylight and at night, unlike its fill.
+        val readyToCast = (1810..1815).any { x ->
+            listOf(594, 615, 650).all { y ->
+                val edge = Color.green(pixel(x, y))
+                val outside = Color.green(pixel(1805, y))
+                edge - outside >= 40
+            }
         }
         val bite = if (readyToCast) null else findFishingBite(frame)
-        if (!readyToCast) session.castTapped = false
         if (readyToCast) session.biteTapped = false
+        if (!readyToCast) session.castTapped = false
 
         val energy = session.energy
-        if (energy != null && energy >= 20 && frameTime - session.energyFrame in 0L..1000L) {
+        if (energy != null && energy >= 20 &&
+            frameTime - session.energyFrame in 0L..1_200L
+        ) {
             if (bite != null && !session.biteTapped) {
                 session.biteTapped = tapFishingPoint(bite.x, bite.y, width, height)
-            } else if (readyToCast && !session.castTapped) {
+                if (session.biteTapped) {
+                    fishingStatus.text = "Gigitan terdeteksi · Menarik kail."
+                }
+            } else if (readyToCast && !session.castTapped &&
+                (session.lastCastFrame == 0L || frameTime - session.lastCastFrame >= 900L)
+            ) {
                 if (tapFishingPoint(width * 0.56f, height * 0.75f, width, height)) {
                     session.castTapped = true
                     session.lastCastFrame = frameTime
+                    // Force a fresh energy read after every cast. The next
+                    // cast is blocked until a current value is recognized.
                     session.energy = null
+                    fishingStatus.text = "Kail dilempar · Menunggu pelampung."
                 }
             }
         }
