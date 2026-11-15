@@ -149,6 +149,9 @@ class ScreenCaptureService : Service() {
         @Volatile
         private var automationActive: Boolean = false
 
+        @Volatile private var fastMinigameCapture: Boolean = false
+        fun setFastMinigameCapture(active: Boolean) { fastMinigameCapture = active }
+
         @Volatile
         var isRunning: Boolean = false
             private set
@@ -357,7 +360,7 @@ class ScreenCaptureService : Service() {
         }
 
         val captureIntervalMs = if (automationActive) {
-            AUTOMATION_CAPTURE_INTERVAL_MS
+            if (fastMinigameCapture) 40L else AUTOMATION_CAPTURE_INTERVAL_MS
         } else {
             IDLE_CAPTURE_INTERVAL_MS
         }
@@ -448,6 +451,7 @@ class ScreenCaptureService : Service() {
 
         isRunning = false
         automationActive = false
+        fastMinigameCapture = false
         virtualDisplay?.release()
         virtualDisplay = null
 
