@@ -125,6 +125,18 @@ class MainActivity : Activity() {
     private var cachedLocationImageHeight = 0
     private var cachedLocationUpdatedAt = 0L
     private var userPaused = false
+    private var fishingSession: FishingSession? = null
+    private lateinit var fishingStatus: TextView
+
+    private class FishingSession(
+        var lastFrame: Long,
+        var castTapped: Boolean = false,
+        var biteTapped: Boolean = false
+    )
+
+    private val fishingEnergyPattern = Regex(
+        """^ENERG[I1L!]\s*(\d{1,3})\s*%""", RegexOption.IGNORE_CASE
+    )
     private var debtTapAttempted = false
     private var debtDialogClearFrames = 0
     private var lastDebtDialogFrame = 0L
@@ -306,6 +318,7 @@ class MainActivity : Activity() {
         val stopAutomaticButton = Button(this).apply {
             text = "STOP"
             setOnClickListener {
+                stopFishing("Memancing dihentikan.")
                 stopContinuousMode()
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
                 pendingStartRunnable = null
@@ -424,6 +437,19 @@ class MainActivity : Activity() {
         page.addView(resumeAutomaticButton, marginParams(6))
         page.addView(stopAutomaticButton, marginParams(6))
         page.addView(automationNote, marginParams(14))
+        page.addView(createHeading("MEMANCING OTOMATIS"), marginParams(8))
+        fishingStatus = TextView(this).apply {
+            text = "Buka mini game Memancing di Sungai. Mode berhenti saat energi di bawah 20%."
+        }
+        page.addView(fishingStatus, marginParams(8))
+        page.addView(Button(this).apply {
+            text = "MULAI MEMANCING OTOMATIS"
+            setOnClickListener { startFishing() }
+        }, marginParams(6))
+        page.addView(Button(this).apply {
+            text = "STOP MEMANCING"
+            setOnClickListener { stopFishing("Memancing dihentikan.") }
+        }, marginParams(14))
         page.addView(parsedHeading, marginParams(12))
         page.addView(orderResultText, marginParams(18))
         page.addView(detectionHeading, marginParams(12))
@@ -781,7 +807,209 @@ class MainActivity : Activity() {
      * Starts one continuous session. Unlike the one-shot test button, this
      * mode discovers each new customer and creates a fresh queue automatically.
      */
+    private fun startFishing() {
+        if (fishingSession != null) return
+        val state = executionManager?.state
+        if (continuousModeEnabled || pendingStartRunnable != null ||
+            state == OrderExecutionManager.State.RUNNING ||
+            state == OrderExecutionManager.State.WAITING_VERIFICATION ||
+            state == OrderExecutionManager.State.PAUSED ||
+            isOcrRunning || isVerificationOcrRunning || continuousScanInFlight
+        ) {
+            fishingStatus.text = "Hentikan mode pesanan dan tunggu pembacaan selesai."
+            return
+        }
+        if (!ScreenCaptureService.isRunning || GestureAccessibilityService.instance == null ||
+            !TargetGameConfig.isConfigured
+        ) {
+            fishingStatus.text = "Aktifkan Screen Capture dan Accessibility terlebih dahulu."
+            return
+        }
+
+        val session = FishingSession(File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME).lastModified())
+        fishingSession = session
+        ScreenCaptureService.setAutomationActive(true)
+        fishingStatus.text = "Pindah ke mini game Memancing di Sungai."
+        updateCaptureNotification("MEMANCING • Menunggu layar mini game")
+        scheduleFishingScan(session, GAME_SWITCH_DELAY_MS)
+    }
+
+    private fun stopFishing(message: String) {
+        if (fishingSession == null) return
+        fishingSession = null
+        ScreenCaptureService.setAutomationActive(false)
+        fishingStatus.text = message
+        updateCaptureNotification("MEMANCING • $message")
+    }
+
+    private fun scheduleFishingScan(session: FishingSession, delay: Long = FRAME_POLL_INTERVAL_MS) {
+        if (fishingSession === session) {
+            mainHandler.postDelayed({ scanFishingFrame(session) }, delay)
+        }
+    }
+
+    private fun scanFishingFrame(session: FishingSession) {
+        if (fishingSession !== session || isFinishing || isDestroyed) return
+        if (!ScreenCaptureService.isRunning) {
+            stopFishing("Screen Capture berhenti.")
+            return
+        }
+        if (GestureAccessibilityService.instance?.isTargetGameForeground() != true) {
+            scheduleFishingScan(session, CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        val file = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
+        val modified = file.lastModified()
+        if (modified <= session.lastFrame) {
+            scheduleFishingScan(session)
+            return
+        }
+        session.lastFrame = modified
+        val frame = BitmapFactory.decodeFile(file.absolutePath)
+        if (frame == null) {
+            scheduleFishingScan(session)
+            return
+        }
+
+        val width = frame.width
+        val height = frame.height
+        if (height < 240 || width.toLong() * 3 < height.toLong() * 5) {
+            frame.recycle()
+            scheduleFishingScan(session, CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+        val top = (height * 0.065f).toInt()
+        val left = (width * 0.15f).toInt()
+        val panel = Bitmap.createBitmap(
+            (width * 0.64f).toInt(), (height * 0.37f).toInt(), Bitmap.Config.ARGB_8888
+        )
+        Canvas(panel).drawBitmap(frame, -left.toFloat(), -top.toFloat(), null)
+        // Isolate the white status text from trees and water in the background.
+        val statusLeft = (width * 0.33f).toInt() - left
+        val statusTop = (height * 0.347f).toInt() - top
+        val statusWidth = (width * 0.43f).toInt()
+        val statusHeight = (height * 0.066f).toInt()
+        val pixels = IntArray(statusWidth * statusHeight)
+        panel.getPixels(pixels, 0, statusWidth, statusLeft, statusTop, statusWidth, statusHeight)
+        for (index in pixels.indices) {
+            val color = pixels[index]
+            pixels[index] = if (
+                Color.red(color) > 207 && Color.green(color) > 207 && Color.blue(color) > 207
+            ) Color.BLACK else Color.WHITE
+        }
+        panel.setPixels(pixels, 0, statusWidth, statusLeft, statusTop, statusWidth, statusHeight)
+        val bite = findFishingBite(frame)
+        frame.recycle()
+
+        val recognizer = textRecognizer ?: OrderTextRecognizer().also { textRecognizer = it }
+        try {
+            recognizer.recognize(
+                bitmap = panel,
+                onSuccess = { result ->
+                    panel.recycle()
+                    if (fishingSession !== session) return@recognize
+                    handleFishingFrame(session, result, width, height, top, bite, modified)
+                    scheduleFishingScan(session)
+                },
+                onFailure = {
+                    panel.recycle()
+                    scheduleFishingScan(session, CONTINUOUS_IDLE_RETRY_MS)
+                }
+            )
+        } catch (_: Exception) {
+            if (!panel.isRecycled) panel.recycle()
+            scheduleFishingScan(session, CONTINUOUS_IDLE_RETRY_MS)
+        }
+    }
+
+    private fun handleFishingFrame(
+        session: FishingSession,
+        result: OcrResult,
+        width: Int,
+        height: Int,
+        cropTop: Int,
+        bite: GestureController.ScreenPoint?,
+        captureModifiedAt: Long
+    ) {
+        if (!result.lines.any { normalizeItemName(it.text) == "memancingdisungai" }) return
+        val energy = result.lines.firstNotNullOfOrNull {
+            fishingEnergyPattern.find(it.text.trim())?.groupValues?.get(1)
+                ?.toIntOrNull()?.takeIf { value -> value in 0..100 }
+        } ?: return
+        if (energy < 20) {
+            stopFishing("Energi $energy%. Memancing otomatis berhenti.")
+            return
+        }
+        if (System.currentTimeMillis() - captureModifiedAt !in 0L..450L ||
+            GestureAccessibilityService.instance?.isTargetGameForeground() != true
+        ) return
+
+        val statusLines = result.lines.filter { it.top + cropTop >= height * 0.33f }
+        val readyToCast = statusLines.any {
+            normalizeItemName(it.text).contains("untukmelemparkail")
+        }
+
+        if (bite == null && !readyToCast) {
+            if (statusLines.any { normalizeItemName(it.text).contains("tunggupelampung") }) {
+                session.castTapped = false
+                session.biteTapped = false
+            }
+            return
+        }
+
+        val point = if (bite != null) {
+            if (session.biteTapped) return
+            session.castTapped = false
+            bite
+        } else {
+            if (session.castTapped) return
+            session.biteTapped = false
+            GestureController.ScreenPoint(width * 0.56f, height * 0.75f)
+        }
+
+        val sent = GestureController.executeTapFromImage(
+            sourceImagePoint = point,
+            imageWidth = width,
+            imageHeight = height,
+            onComplete = { _, _ -> }
+        )
+        if (sent) {
+            if (bite != null) session.biteTapped = true else session.castTapped = true
+        }
+    }
+
+    private fun findFishingBite(frame: Bitmap): GestureController.ScreenPoint? {
+        val width = frame.width
+        val height = frame.height
+        val step = (height / 270).coerceAtLeast(1)
+        val side = (height * 0.021f).toInt()
+        val up = (height * 0.012f).toInt()
+        val down = (height * 0.016f).toInt()
+        fun isGold(x: Int, y: Int): Boolean {
+            val pixel = frame.getPixel(x, y)
+            return Color.red(pixel) >= 225 && Color.green(pixel) in 175..235 &&
+                Color.blue(pixel) in 75..155
+        }
+        for (y in (height * 0.46f).toInt()..(height * 0.80f).toInt() step step) {
+            for (x in (width * 0.29f).toInt()..(width * 0.75f).toInt() step step) {
+                if (!isGold(x - side, y - up) || !isGold(x + side, y - up) ||
+                    !isGold(x - side, y + down) || !isGold(x + side, y + down)
+                ) continue
+                val center = frame.getPixel(x, y - up)
+                if (Color.red(center) < 140 && Color.green(center) < 105) {
+                    return GestureController.ScreenPoint(x.toFloat(), y + height * 0.11f)
+                }
+            }
+        }
+        return null
+    }
+
     private fun prepareContinuousMode() {
+        if (fishingSession != null) {
+            executionStatusText.text = "Hentikan mode memancing sebelum memulai mode pesanan."
+            return
+        }
         if (continuousModeEnabled) {
             executionStatusText.text = "Mode otomatis berkelanjutan sudah aktif. Gunakan PAUSE atau STOP."
             return
@@ -1965,6 +2193,10 @@ class MainActivity : Activity() {
     }
 
     private fun prepareAutomaticExecution(singleItemOnly: Boolean) {
+        if (fishingSession != null) {
+            executionStatusText.text = "Hentikan mode memancing sebelum memulai uji pesanan."
+            return
+        }
         if (continuousModeEnabled) {
             executionStatusText.text = "Mode otomatis berkelanjutan sedang aktif. Tekan STOP sebelum menjalankan uji satu barang."
             return
@@ -2204,6 +2436,10 @@ class MainActivity : Activity() {
     }
 
     private fun scheduleResumeAfterGameSwitch() {
+        if (fishingSession != null) {
+            executionStatusText.text = "Hentikan mode memancing sebelum melanjutkan pesanan."
+            return
+        }
         val manager = executionManager
         val hasPausedQueue = manager?.state == OrderExecutionManager.State.PAUSED
 
@@ -2765,6 +3001,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopScreenCapture() {
+        stopFishing("Memancing dihentikan karena capture dimatikan.")
         stopContinuousMode()
         executionManager?.stop()
         GestureAccessibilityService.instance?.cancelPendingTapBatch()
@@ -2935,6 +3172,10 @@ class MainActivity : Activity() {
     }
 
     private fun runOcr() {
+        if (fishingSession != null) {
+            fishingStatus.text = "Hentikan mode memancing sebelum membaca pesanan."
+            return
+        }
         if (isOcrRunning) {
             statusText.text = "OCR masih sedang berjalan."
             return
@@ -3344,6 +3585,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopFishing("Memancing dihentikan.")
         pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingStartRunnable = null
         stopContinuousMode()
