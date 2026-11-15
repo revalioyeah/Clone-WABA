@@ -25,6 +25,7 @@ import android.os.SystemClock
 import android.system.Os
 import android.util.Log
 import android.view.WindowManager
+import com.warung.autobag.MainActivity
 import com.warung.autobag.gesture.GestureAccessibilityService
 import java.io.File
 import java.io.FileOutputStream
@@ -44,7 +45,105 @@ class ScreenCaptureService : Service() {
         private const val CHANNEL_ID = "screen_capture_channel"
         private const val NOTIFICATION_ID = 2001
         private const val REQUEST_STOP = 2002
+        private const val REQUEST_OPEN_APP = 2003
         private const val IDLE_CAPTURE_INTERVAL_MS = 1000L
+
+        @Volatile
+        private var currentNotificationStatus =
+            "Capture aktif • Otomatisasi belum dimulai"
+
+        /**
+         * Update the persistent foreground-service notification so the user
+         * can inspect status and reopen MainActivity without using Recents.
+         */
+        fun updateStatus(context: Context, status: String) {
+            if (!isRunning) return
+            val safeStatus = status.take(140)
+            if (safeStatus == currentNotificationStatus) return
+            currentNotificationStatus = safeStatus
+
+            val appContext = context.applicationContext
+            ensureNotificationChannel(appContext)
+            try {
+                val manager = appContext.getSystemService(
+                    NotificationManager::class.java
+                )
+                manager.notify(
+                    NOTIFICATION_ID,
+                    buildNotification(appContext, safeStatus)
+                )
+            } catch (exception: SecurityException) {
+                Log.w(TAG, "Izin notifikasi belum diberikan", exception)
+            } catch (exception: Exception) {
+                Log.w(TAG, "Gagal memperbarui notifikasi status", exception)
+            }
+        }
+
+        private fun ensureNotificationChannel(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "Warung Auto Bag Assistant",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Status Screen Capture dan otomatisasi pesanan"
+                }
+                context.getSystemService(NotificationManager::class.java)
+                    .createNotificationChannel(channel)
+            }
+        }
+
+        private fun buildNotification(
+            context: Context,
+            status: String
+        ): Notification {
+            val openIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+            val openPendingIntent = PendingIntent.getActivity(
+                context,
+                REQUEST_OPEN_APP,
+                openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val stopIntent = Intent(context, ScreenCaptureService::class.java).apply {
+                action = ACTION_STOP
+            }
+            val stopPendingIntent = PendingIntent.getService(
+                context,
+                REQUEST_STOP,
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            return Notification.Builder(context, CHANNEL_ID)
+                .setContentTitle("Warung Auto Bag Assistant")
+                .setContentText(status)
+                .setStyle(Notification.BigTextStyle().bigText(status))
+                .setSmallIcon(android.R.drawable.ic_menu_camera)
+                .setContentIntent(openPendingIntent)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .setOnlyAlertOnce(true)
+                .setOngoing(true)
+                .addAction(
+                    Notification.Action.Builder(
+                        android.R.drawable.ic_menu_view,
+                        "Buka aplikasi",
+                        openPendingIntent
+                    ).build()
+                )
+                .addAction(
+                    Notification.Action.Builder(
+                        android.R.drawable.ic_media_pause,
+                        "Hentikan capture",
+                        stopPendingIntent
+                    ).build()
+                )
+                .build()
+        }
         private const val AUTOMATION_CAPTURE_INTERVAL_MS = 120L
 
         @Volatile
@@ -110,9 +209,13 @@ class ScreenCaptureService : Service() {
         }
 
         try {
-            createNotificationChannel()
+            currentNotificationStatus = "Capture aktif • Otomatisasi belum dimulai"
+            ensureNotificationChannel(this)
 
-            val notification = buildNotification()
+            val notification = buildNotification(
+                this,
+                currentNotificationStatus
+            )
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
@@ -331,64 +434,6 @@ class ScreenCaptureService : Service() {
             temporaryFile.delete()
             image.close()
         }
-    }
-
-    private fun createNotificationChannel() {
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Warung Auto Bag Screen Capture",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description =
-                    "Menampilkan status pengambilan layar"
-            }
-
-            val manager = getSystemService(
-                NotificationManager::class.java
-            )
-
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(): Notification {
-
-        val stopIntent = Intent(
-            this,
-            ScreenCaptureService::class.java
-        ).apply {
-            action = ACTION_STOP
-        }
-
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            REQUEST_STOP,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or
-                PendingIntent.FLAG_IMMUTABLE
-        )
-
-        return Notification.Builder(
-            this,
-            CHANNEL_ID
-        )
-            .setContentTitle("Warung Auto Bag Assistant")
-            .setContentText(
-                "Screen Capture sedang berjalan"
-            )
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setOngoing(true)
-            .addAction(
-                Notification.Action.Builder(
-                    android.R.drawable.ic_media_pause,
-                    "Hentikan",
-                    stopPendingIntent
-                ).build()
-            )
-            .build()
     }
 
     private fun stopCapture() {
