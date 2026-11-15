@@ -295,10 +295,13 @@ object ItemCatalog {
         )
     )
 
-    fun find(itemName: String): CatalogEntry? {
+    fun find(
+        itemName: String,
+        sourceEntries: List<CatalogEntry> = entries
+    ): CatalogEntry? {
         val normalizedName = normalize(itemName)
 
-        return entries.firstOrNull { entry ->
+        return sourceEntries.firstOrNull { entry ->
             entry.aliases.any { alias ->
                 normalize(alias) == normalizedName
             } || normalize(entry.name) == normalizedName
