@@ -34,6 +34,13 @@ class NpcAutomation(
     private var stableCount = 0
     private var previousX: Int? = null
     private var previousTime = 0L
+    private var previousVelocity: Float? = null
+    private var scheduledDrop: Runnable? = null
+    private var dispatchLeadMs = 35f
+    private var dropVelocity = 0f
+    private var dropTarget = 1170
+    private var dropObserved = false
+    private var stackBeforeDropY = 900
     private var waitingForDrop = false
     private var dropTime = 0L
     private var lastDrag: NpcVision.Action? = null
@@ -45,7 +52,7 @@ class NpcAutomation(
         active = true
         lastFrame = File(directory, ScreenCaptureService.CAPTURE_FILE_NAME).lastModified()
         ScreenCaptureService.setAutomationActive(true)
-        ScreenCaptureService.setFastMinigameCapture(game == NpcVision.Game.UJANG)
+        ScreenCaptureService.setFastMinigameCapture(game != NpcVision.Game.GISKA)
         status("Pindah ke minigame ${game.title}. Menunggu panel permainan.")
         handler.postDelayed(scan, 1500)
     }
@@ -53,6 +60,7 @@ class NpcAutomation(
         if (!active) return
         active = false
         handler.removeCallbacks(scan)
+        cancelScheduledDrop()
         ScreenCaptureService.setFastMinigameCapture(false)
         ScreenCaptureService.setAutomationActive(false)
         recognizer.close()
@@ -66,7 +74,8 @@ class NpcAutomation(
                 stop("Capture atau Accessibility terputus."); return
             }
             if (GestureAccessibilityService.instance?.isTargetGameForeground() != true) {
-                titleUntil = 0L; previousX = null; stableCount = 0
+                cancelScheduledDrop()
+                titleUntil = 0L; previousX = null; previousVelocity = null; stableCount = 0
                 return
             }
             val file = File(directory, ScreenCaptureService.CAPTURE_FILE_NAME)
@@ -85,7 +94,8 @@ class NpcAutomation(
                     (y * frame.height / 1080).coerceIn(0, frame.height - 1)) }
                 readScreen(frame, now)
                 if (!v.panelVisible(game)) {
-                    previousX = null; stableCount = 0
+                    cancelScheduledDrop()
+                    previousX = null; previousVelocity = null; stableCount = 0
                     if (seenPanel) {
                         if (absentSince == 0L) absentSince = now
                         if (now - absentSince > 1800) stop("Panel permainan berakhir atau tertutup. Switch dimatikan.")
@@ -93,7 +103,7 @@ class NpcAutomation(
                     return
                 }
                 absentSince = 0L
-                if (now > titleUntil) return
+                if (now > titleUntil) { cancelScheduledDrop(); return }
                 seenPanel = true
                 if (gestureBusy || now < nextAction) return
                 when (game) {
@@ -107,13 +117,19 @@ class NpcAutomation(
                             stableCount = 0
                         }
                     }
-                    NpcVision.Game.UJANG -> handleCement(v, frame, now, age)
+                    NpcVision.Game.UJANG -> handleCement(v, frame, now, modified)
                     NpcVision.Game.SUMI -> {
+                        // A ready pan always outranks retrying a plate gesture.
+                        val urgent = v.urgentPanAction()
+                        if (urgent != null && urgent != lastDrag) {
+                            lastDrag = urgent; dragRetries = 0
+                            lastSourceFood = v.food(urgent.from)
+                            send(urgent, frame, now)
+                            return
+                        }
                         val old = lastDrag
                         if (old != null) {
-                            val same = v.food(old.from, old.from.x < 900) == lastSourceFood
-                            val placed = old.to in v.tray && old.to?.let { v.food(it) } == NpcVision.Food.COOKED
-                            if (same && !placed) {
+                            if (!v.dragDelivered(old, lastSourceFood)) {
                                 if (++dragRetries > 2) { stop("Drag belum berhasil setelah 3 percobaan. Periksa posisi layar."); return }
                                 send(old, frame, now); return
                             }
@@ -134,28 +150,63 @@ class NpcAutomation(
             if (active) handler.postDelayed(scan, 25)
         }
     }
-    private fun handleCement(v: NpcVision, frame: Bitmap, now: Long, age: Long) {
+    private fun cancelScheduledDrop() {
+        scheduledDrop?.let { handler.removeCallbacks(it) }
+        scheduledDrop = null
+    }
+    private fun handleCement(v: NpcVision, frame: Bitmap, now: Long, frameTime: Long) {
+        cancelScheduledDrop()
         val moving = v.hangingCement()
         if (waitingForDrop) {
-            if (moving == null) { waitingForDrop = false; nextAction = now + 300; previousX = null }
-            else if (now - dropTime > 2000) { waitingForDrop = false; previousX = null }
+            val top = v.stackTop()
+            // Learn release latency from the newly falling sack, not a tilted settled stack.
+            if (!dropObserved && top != null && top.y < stackBeforeDropY - 45 &&
+                now - dropTime in 40..800 && abs(dropVelocity) >= 0.3f) {
+                dispatchLeadMs = CementTiming.adjustLead(dispatchLeadMs, top.x, dropTarget, dropVelocity)
+                dropObserved = true
+            }
+            if (moving == null) { previousX = null; previousVelocity = null }
+            if (now - dropTime > 550 && moving != null && previousX == null) {
+                waitingForDrop = false
+            } else if (now - dropTime > 1800) {
+                waitingForDrop = false; previousX = null; previousVelocity = null
+            }
             return
         }
-        if (moving == null) { previousX = null; return }
+        if (moving == null) { previousX = null; previousVelocity = null; return }
         val prior = previousX
-        val dt = now - previousTime
-        previousX = moving.x; previousTime = now
-        if (prior == null || dt !in 15..250) return
+        val dt = frameTime - previousTime
+        previousX = moving.x; previousTime = frameTime
+        if (prior == null || dt !in 15..200) { previousVelocity = null; return }
         val velocity = (moving.x - prior).toFloat() / dt
-        if (abs(velocity) > 5f) return // animation/reset, not horizontal travel
-        val target = v.stackCenter()
-        // Frame write age + short dispatch estimate; do not chase an already missed crossing.
-        val predicted = moving.x + velocity * (age.coerceAtMost(120) + 35)
-        if (abs(predicted - target) <= 38 && abs(moving.x - target) <= 110) {
-            if (send(NpcVision.Action(NpcVision.Point(1170, 600), label = "Jatuhkan semen di pusat tumpukan"), frame, now)) {
-                waitingForDrop = true; dropTime = now
-            }
-        } else status("Menunggu semen sejajar dengan tumpukan.")
+        val oldVelocity = previousVelocity
+        previousVelocity = velocity
+        if (oldVelocity == null) return
+        val speed = velocity * 0.7f + oldVelocity * 0.3f
+        val target = v.cementTarget()
+        val age = (System.currentTimeMillis() - frameTime).coerceAtLeast(0)
+        val delay = CementTiming.crossingDelay(moving.x, target, velocity, oldVelocity, age, dispatchLeadMs) ?: return
+        val width = frame.width; val height = frame.height
+        val supportY = v.stackTop()?.y ?: 900
+        val task = Runnable {
+            scheduledDrop = null
+            if (!active || gestureBusy || SystemClock.uptimeMillis() > titleUntil ||
+                System.currentTimeMillis() - lastFrame > 200 ||
+                GestureAccessibilityService.instance?.isTargetGameForeground() != true) return@Runnable
+            gestureBusy = true
+            val accepted = GestureController.executeTapFromImage(
+                GestureController.ScreenPoint(width * 0.5f, height * 0.56f), width, height,
+                durationMs = 20, onComplete = { _, _ -> gestureBusy = false })
+            if (accepted) {
+                waitingForDrop = true; dropTime = SystemClock.uptimeMillis()
+                dropVelocity = speed; dropTarget = target; dropObserved = false
+                stackBeforeDropY = supportY
+                previousX = null; previousVelocity = null
+                status("Semen dijatuhkan menuju pusat gerobak.")
+            } else gestureBusy = false
+        }
+        scheduledDrop = task
+        handler.postDelayed(task, delay.toLong().coerceAtLeast(0))
     }
     private fun send(action: NpcVision.Action, frame: Bitmap, now: Long): Boolean {
         fun point(p: NpcVision.Point) = GestureController.ScreenPoint(
@@ -165,7 +216,7 @@ class NpcAutomation(
         val complete: (Boolean, String) -> Unit = { success, message ->
             gestureBusy = false
             if (active) {
-                nextAction = maxOf(nextAction, SystemClock.uptimeMillis() + if (action.to != null) 180 else 60)
+                nextAction = maxOf(nextAction, SystemClock.uptimeMillis() + if (action.to != null) { if (game == NpcVision.Game.SUMI) 80 else 180 } else 60)
                 if (!success) status("Gesture ditolak: $message")
             }
         }

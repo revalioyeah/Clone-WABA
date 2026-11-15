@@ -61,19 +61,28 @@ class NpcVision(private val pixel: (Int, Int) -> Int) {
     private fun cement(c: Int) = r(c) < 110 && g(c) in 65..165 && b(c) > g(c) + 25 && g(c) > r(c) + 15
     fun hangingCement(): Blob? = blobs(420, 398, 1910, 475, ::cement)
         .filter { it.width in 90..175 && it.height in 16..65 }.maxByOrNull { it.area }
-    fun stackCenter(): Int = blobs(850, 510, 1480, 865, ::cement)
-        .filter { it.width in 85..180 && it.height in 16..75 }.minByOrNull { it.y }?.x ?: 1170
+    fun stackTop(): Blob? = blobs(800, 490, 1510, 900, ::cement)
+        .filter { it.width in 85..180 && it.height in 16..75 }.minByOrNull { it.y }
+    fun stackCenter(): Int = stackTop()?.x ?: 1170
+    // The cart remains the anchor. Do not reproduce accumulated sideways errors.
+    fun cementTarget(): Int {
+        val support = stackCenter()
+        return CementTiming.target(support)
+    }
 
     val plate = listOf(Point(652, 505), Point(840, 505), Point(652, 670), Point(840, 670))
     val pan = listOf(Point(1041, 825), Point(1152, 850))
     val tray = listOf(Point(1532, 505), Point(1668, 584), Point(1668, 742),
         Point(1532, 820), Point(1395, 742), Point(1395, 584), Point(1532, 663))
     fun food(p: Point, onPlate: Boolean = false): Food {
+        val inPan = p in pan
         var raw = 0; var cooked = 0; var burnt = 0; var blue = 0
         for (dx in -24..24 step 8) for (dy in -24..24 step 8) {
             val c = pixel(p.x + dx, p.y + dy)
             if (r(c) > 190 && g(c) > 180 && b(c) > 145 && r(c) - b(c) < 70) raw++
-            if (r(c) > 205 && g(c) in 155..235 && b(c) in 55..165 && r(c) - b(c) > 75) cooked++
+            if ((r(c) > 205 && g(c) in 155..235 && b(c) in 55..165 && r(c) - b(c) > 75) ||
+                (inPan && r(c) >= 175 && g(c) in 130..230 && b(c) in 50..165 &&
+                    r(c) - b(c) >= 65 && r(c) - g(c) >= 20)) cooked++
             if (r(c) in 90..160 && g(c) in 55..118 && b(c) in 25..85 && r(c) - g(c) > 27) burnt++
             if (b(c) > r(c) + 20 && g(c) > r(c)) blue++
         }
@@ -99,16 +108,30 @@ class NpcVision(private val pixel: (Int, Int) -> Int) {
         }
         return hits >= 7 && food(p) !in listOf(Food.RAW, Food.COOKED)
     }
-    fun rengginangAction(): Action? {
+    fun dragDelivered(action: Action, sourceBefore: Food?): Boolean {
+        val target = action.to ?: return false
+        val targetFood = food(target)
+        if (target in pan && targetFood in listOf(Food.RAW, Food.COOKED, Food.BURNT)) return true
+        if (target in tray && targetFood == Food.COOKED) return true
+        return food(action.from, action.from.x < 900) != sourceBefore
+    }
+    fun urgentPanAction(): Action? {
         val destination = tray.firstOrNull { emptyRing(it) }
         val cookedPan = pan.firstOrNull { food(it) == Food.COOKED }
         if (cookedPan != null && destination != null) return Action(cookedPan, destination, "Angkat dari wajan")
         val burntPan = pan.firstOrNull { food(it) == Food.BURNT }
         if (burntPan != null) return Action(burntPan, Point(530, 880), "Buang gosong dari wajan")
+        return null
+    }
+    fun rengginangAction(): Action? {
+        urgentPanAction()?.let { return it }
+        val destination = tray.firstOrNull { emptyRing(it) }
         val cookedPlate = plate.firstOrNull { food(it, true) == Food.COOKED }
         if (cookedPlate != null && destination != null) return Action(cookedPlate, destination, "Susun rengginang matang")
         val burntPlate = plate.firstOrNull { food(it, true) == Food.BURNT }
         if (burntPlate != null) return Action(burntPlate, Point(530, 880), "Buang rengginang gosong")
+        // One batch in the pan at a time; reserve a free tray slot before frying.
+        if (destination == null || pan.any { food(it) in listOf(Food.RAW, Food.COOKED, Food.BURNT) }) return null
         val rawPlate = plate.firstOrNull { food(it, true) == Food.RAW }
         val emptyPan = pan.firstOrNull { p ->
             var oil = 0
@@ -120,5 +143,21 @@ class NpcVision(private val pixel: (Int, Int) -> Int) {
         }
         if (rawPlate != null && emptyPan != null) return Action(rawPlate, emptyPan, "Goreng rengginang putih")
         return null
+    }
+}
+
+/** Timing in reference pixels and milliseconds, isolated for replay/unit tests. */
+object CementTiming {
+    fun target(support: Int): Int = support + (1170 - support).coerceIn(-60, 60)
+    fun crossingDelay(x: Int, target: Int, velocity: Float, previous: Float?, age: Long, lead: Float): Long? {
+        if (previous == null || age !in 0..180 || abs(velocity) !in 0.2f..5f ||
+            velocity * previous <= 0f || abs(velocity - previous) > maxOf(0.6f, abs(velocity) * 0.4f)) return null
+        val speed = velocity * 0.7f + previous * 0.3f
+        val delay = (target - (x + speed * (age + lead))) / speed
+        return if (delay in -6f..80f) delay.toLong().coerceAtLeast(0) else null
+    }
+    fun adjustLead(current: Float, releaseX: Int, target: Int, speed: Float): Float {
+        if (abs(speed) < 0.3f) return current
+        return (current + ((releaseX - target) / speed).coerceIn(-60f, 60f) * 0.5f).coerceIn(10f, 160f)
     }
 }
