@@ -1,10 +1,12 @@
 package com.warung.autobag
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -46,6 +48,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_SCREEN_CAPTURE = 3101
+        private const val REQUEST_POST_NOTIFICATIONS = 3102
         private const val REFERENCE_IMAGE_WIDTH = 2304f
         private const val MAX_VERIFICATION_ATTEMPTS = 5
         private const val MAX_CAPTURE_WAIT_MS = 900L
@@ -246,6 +249,7 @@ class MainActivity : Activity() {
                 executionManager?.pause()
                 GestureAccessibilityService.instance?.cancelPendingTapBatch()
                 executionStatusText.text = "PAUSE diminta. Mode otomatis menunggu perintah LANJUTKAN."
+                updateCaptureNotification("PAUSED • Dijeda oleh pengguna")
             }
         }
 
@@ -318,7 +322,7 @@ class MainActivity : Activity() {
                 3. Pindah ke Warung Life Simulator.
                 4. Tunggu sampai papan pesanan pelanggan terlihat.
                 5. Biarkan Screen Capture tetap aktif.
-                6. Kembali ke aplikasi assistant melalui Recent Apps.
+                6. Kembali ke aplikasi assistant dengan mengetuk notifikasi Warung Auto Bag Assistant.
                 7. Tekan BACA PESANAN & DETEKSI LOKASI untuk pemeriksaan kalibrasi awal.
                 8. Periksa hasil OCR dan pastikan setiap penanda hijau berada di tengah gambar produk.
                 9. Centang konfirmasi kalibrasi.
@@ -383,6 +387,56 @@ class MainActivity : Activity() {
     }
 
 
+    private fun updateCaptureNotification(status: String) {
+        if (ScreenCaptureService.isRunning) {
+            ScreenCaptureService.updateStatus(applicationContext, status)
+        }
+    }
+
+    private fun requestScreenCapturePermissionFlow() {
+        if (
+            Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                REQUEST_POST_NOTIFICATIONS
+            )
+            return
+        }
+        launchScreenCaptureConsent()
+    }
+
+    private fun launchScreenCaptureConsent() {
+        val manager = getSystemService(
+            Context.MEDIA_PROJECTION_SERVICE
+        ) as MediaProjectionManager
+
+        startActivityForResult(
+            manager.createScreenCaptureIntent(),
+            REQUEST_SCREEN_CAPTURE
+        )
+    }
+
+    @Deprecated("Use Activity Result APIs when modernizing the screen-capture flow")
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_POST_NOTIFICATIONS) return
+
+        if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(
+                this,
+                "Notifikasi tidak diizinkan. Screen Capture tetap dapat berjalan, tetapi status tidak akan muncul di panel notifikasi.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        launchScreenCaptureConsent()
+    }
+
     private fun createExecutionManager() {
         executionManager = OrderExecutionManager(
             tapDispatcher = OrderExecutionManager.TapDispatcher { commands, onComplete ->
@@ -407,6 +461,25 @@ class MainActivity : Activity() {
                             snapshot.state == OrderExecutionManager.State.RUNNING ||
                             snapshot.state == OrderExecutionManager.State.WAITING_VERIFICATION
                     )
+                    val notificationStatus = when (snapshot.state) {
+                        OrderExecutionManager.State.IDLE ->
+                            "Capture aktif • Otomatisasi belum dimulai"
+                        OrderExecutionManager.State.RUNNING ->
+                            "RUNNING • ${snapshot.currentItem ?: "Memproses pesanan"}"
+                        OrderExecutionManager.State.WAITING_VERIFICATION ->
+                            "VERIFYING • Memeriksa hasil tap"
+                        OrderExecutionManager.State.PAUSED ->
+                            if (userPaused) "PAUSED • Dijeda oleh pengguna"
+                            else "PAUSED • Menunggu verifikasi atau panel"
+                        OrderExecutionManager.State.COMPLETED ->
+                            if (continuousModeEnabled) "RUNNING • Menunggu pelanggan berikutnya"
+                            else "COMPLETED • Pesanan selesai"
+                        OrderExecutionManager.State.STOPPED ->
+                            "STOPPED • Otomatisasi dihentikan"
+                        OrderExecutionManager.State.FAILED ->
+                            "PERLU PERHATIAN • ${snapshot.message.take(90)}"
+                    }
+                    updateCaptureNotification(notificationStatus)
                     if (snapshot.state == OrderExecutionManager.State.COMPLETED) {
                         lastServedCustomerSignature = activeCustomerSignature
                         autoPausedAwaitingPanel = false
@@ -515,6 +588,7 @@ class MainActivity : Activity() {
                 ScreenCaptureService.setAutomationActive(true)
                 executionStatusText.text =
                     "MODE BERKELANJUTAN AKTIF. Pindah ke game; sistem mulai memantau pelanggan."
+                updateCaptureNotification("RUNNING • Memantau panel pesanan")
                 scheduleContinuousMonitor(GAME_SWITCH_DELAY_MS)
             }
             .show()
@@ -550,6 +624,7 @@ class MainActivity : Activity() {
         if (accessibility == null || !accessibility.isTargetGameForeground()) {
             executionStatusText.text =
                 "MODE BERKELANJUTAN MENUNGGU: buka Warung Life Simulator agar panel pelanggan dapat dipantau."
+            updateCaptureNotification("MENUNGGU • Buka game untuk melanjutkan pemantauan")
             scheduleContinuousMonitor(800L)
             return
         }
@@ -621,6 +696,7 @@ class MainActivity : Activity() {
         val usingPanelCrop = panelBitmap != null
         continuousScanInFlight = true
         isOcrRunning = true
+        updateCaptureNotification("SCANNING • Membaca panel pesanan")
 
         val recognizer = textRecognizer
             ?: OrderTextRecognizer().also { textRecognizer = it }
@@ -761,12 +837,24 @@ class MainActivity : Activity() {
             candidateStableFrameCount = 1
         }
 
-        if (candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT) {
+        val completeLargeOrder =
+            parsed.items.size >= 5 &&
+                parsed.items.all { item ->
+                    item.currentQuantity != null &&
+                        item.requiredQuantity != null &&
+                        item.requiredQuantity > 0
+                }
+
+        if (
+            candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT &&
+            !completeLargeOrder
+        ) {
             if (!fullBitmap.isRecycled) fullBitmap.recycle()
             continuousScanInFlight = false
             isOcrRunning = false
             executionStatusText.text =
                 "Panel pesanan terdeteksi. Memastikan daftar stabil (${candidateStableFrameCount}/${CONTINUOUS_STABLE_FRAME_COUNT})."
+            updateCaptureNotification("SCANNING • Memastikan daftar pesanan")
             scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
             return
         }
@@ -1126,6 +1214,7 @@ class MainActivity : Activity() {
             latestCaptureModifiedAtOcr = captureModifiedAt
             executionStatusText.text =
                 "Panel pelanggan terdeteksi, tetapi seluruh jumlah pesanan sudah terpenuhi. Menunggu pelanggan berikutnya."
+            updateCaptureNotification("RUNNING • Menunggu pelanggan berikutnya")
             scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
             return
         }
@@ -1181,6 +1270,7 @@ class MainActivity : Activity() {
                 ocrResultText.text = if (useCustomerLabelFromResult) buildRawOcrOutput(result) else "Pesanan dibaca dari panel; lokasi rak menggunakan cache hasil pemindaian awal."
                 executionStatusText.text =
                     "Pelanggan baru terdeteksi: ${tasks.size} jenis pesanan. Memulai eksekusi otomatis."
+                updateCaptureNotification("RUNNING • Memproses ${tasks.size} jenis barang")
                 executionManager?.start(tasks)
             }
         }
@@ -1363,6 +1453,7 @@ class MainActivity : Activity() {
         continuousMonitorRunnable = null
         pendingVerification = null
         ScreenCaptureService.setAutomationActive(false)
+        updateCaptureNotification("STOPPED • Otomatisasi dihentikan; capture masih aktif")
     }
 
     private fun prepareAutomaticExecution(singleItemOnly: Boolean) {
@@ -1629,6 +1720,7 @@ class MainActivity : Activity() {
             } else {
                 executionStatusText.text = "Pemantauan pelanggan dilanjutkan."
                 ScreenCaptureService.setAutomationActive(true)
+                updateCaptureNotification("RUNNING • Pemantauan pelanggan dilanjutkan")
                 scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
             }
         }
@@ -2082,12 +2174,12 @@ class MainActivity : Activity() {
             return
         }
 
-        // Parser uses a 260px horizontal margin and 250px vertical range
-        // around the PESANAN header. Add a little safety margin for OCR boxes.
+        // Read up to 520px below the PESANAN header so longer customer
+        // orders (more than four item rows) remain inside the OCR crop.
         val left = (header.left - 300).coerceAtLeast(0)
         val top = (header.top - 24).coerceAtLeast(0)
         val right = (header.right + 300).coerceAtMost(imageWidth)
-        val bottom = (header.bottom + 290).coerceAtMost(imageHeight)
+        val bottom = (header.bottom + 560).coerceAtMost(imageHeight)
 
         verificationRegion = if (right > left && bottom > top) {
             Rect(left, top, right, bottom)
@@ -2109,14 +2201,7 @@ class MainActivity : Activity() {
     }
 
     private fun requestScreenCapture() {
-        val manager = getSystemService(
-            Context.MEDIA_PROJECTION_SERVICE
-        ) as MediaProjectionManager
-
-        startActivityForResult(
-            manager.createScreenCaptureIntent(),
-            REQUEST_SCREEN_CAPTURE
-        )
+        requestScreenCapturePermissionFlow()
     }
 
     @Deprecated("Using MediaProjection consent result")
@@ -2360,6 +2445,7 @@ class MainActivity : Activity() {
         latestCaptureModifiedAtOcr = imageFile.lastModified()
 
         isOcrRunning = true
+        updateCaptureNotification("SCANNING • Membaca pesanan dan lokasi rak")
         statusText.text = "Sedang membaca teks dan mencari lokasi barang..."
         orderResultText.text = "Proses pembacaan pesanan sedang berjalan..."
         detectionResultText.text = "Sedang mencari label barang pada area rak..."
@@ -2427,6 +2513,7 @@ class MainActivity : Activity() {
 
                     statusText.text =
                         "OCR selesai. ${parsed.message} ${detection.message}"
+                    updateCaptureNotification("READY • Pembacaan pesanan dan lokasi rak selesai")
                 },
                 onFailure = { exception ->
                     if (!bitmap.isRecycled) {
@@ -2441,6 +2528,7 @@ class MainActivity : Activity() {
 
                     statusText.text =
                         "OCR gagal: ${exception.message}"
+                    updateCaptureNotification("PERLU PERHATIAN • OCR awal gagal")
                     orderResultText.text =
                         "Pesanan belum dapat diproses karena OCR gagal."
                     detectionResultText.text =
