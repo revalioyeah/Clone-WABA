@@ -57,6 +57,8 @@ import com.warung.autobag.ocr.ParsedOrderItem
 import com.warung.autobag.ocr.OrderTextRecognizer
 import com.warung.autobag.ocr.OcrResult
 import java.io.File
+import com.warung.autobag.minigame.NpcAutomation
+import com.warung.autobag.minigame.NpcVision
 
 class MainActivity : Activity() {
 
@@ -129,6 +131,10 @@ class MainActivity : Activity() {
     private var cachedLocationImageHeight = 0
     private var cachedLocationUpdatedAt = 0L
     private var userPaused = false
+    private var npcAutomation: NpcAutomation? = null
+    private val npcSwitches = mutableMapOf<NpcVision.Game, Switch>()
+    private var syncingNpcSwitches = false
+
     private var fishingSession: FishingSession? = null
     private lateinit var fishingStatus: TextView
     private lateinit var fishingSwitch: Switch
@@ -448,6 +454,25 @@ class MainActivity : Activity() {
             if (!syncingFishingSwitch) {
                 if (enabled) startFishing() else stopFishing("Memancing dihentikan.")
                 syncFishingSwitch()
+            }
+        }
+
+        NpcVision.Game.values().forEach { game ->
+            val description = TextView(this).apply {
+                text = when (game) {
+                    NpcVision.Game.GISKA -> "Pilih kardus sesuai ukuran barang."
+                    NpcVision.Game.UJANG -> "Jatuhkan semen ketika sejajar."
+                    NpcVision.Game.SUMI -> "Goreng, susun yang matang, buang yang gosong."
+                }
+                textSize = 14f
+                setTextColor(Color.rgb(64, 83, 74))
+            }
+            npcSwitches[game] = addMiniGameCard(miniGamesPage, game.title, description) { enabled ->
+                if (!syncingNpcSwitches) {
+                    if (enabled) startNpcGame(game, description)
+                    else npcAutomation?.stop("Minigame dihentikan.")
+                    if (npcAutomation == null) syncNpcSwitches(null)
+                }
             }
         }
 
@@ -868,6 +893,43 @@ class MainActivity : Activity() {
      * Starts one continuous session. Unlike the one-shot test button, this
      * mode discovers each new customer and creates a fresh queue automatically.
      */
+    private fun syncNpcSwitches(selected: NpcVision.Game?) {
+        syncingNpcSwitches = true
+        npcSwitches.forEach { (game, control) -> control.isChecked = game == selected }
+        syncingNpcSwitches = false
+    }
+
+    private fun startNpcGame(game: NpcVision.Game, description: TextView) {
+        val state = executionManager?.state
+        if (continuousModeEnabled || pendingStartRunnable != null ||
+            state == OrderExecutionManager.State.RUNNING ||
+            state == OrderExecutionManager.State.WAITING_VERIFICATION ||
+            state == OrderExecutionManager.State.PAUSED ||
+            isOcrRunning || isVerificationOcrRunning || continuousScanInFlight) {
+            description.text = "Hentikan mode warung terlebih dahulu."
+            syncNpcSwitches(null)
+            return
+        }
+        if (!ScreenCaptureService.isRunning || GestureAccessibilityService.instance == null || !TargetGameConfig.isConfigured) {
+            description.text = "Aktifkan Screen Capture dan Accessibility terlebih dahulu."
+            syncNpcSwitches(null)
+            return
+        }
+        npcAutomation?.stop("Beralih minigame.")
+        stopFishing("Beralih ke minigame NPC.")
+        val controller = NpcAutomation(filesDir, game,
+            status = { description.text = it },
+            stopped = {
+                npcAutomation = null
+                syncNpcSwitches(null)
+                updateCaptureNotification("MINI GAME • Berhenti")
+            })
+        npcAutomation = controller
+        syncNpcSwitches(game)
+        updateCaptureNotification("MINI GAME • ${game.title}")
+        controller.start()
+    }
+
     private fun startFishing() {
         if (fishingSession != null) return
         val state = executionManager?.state
@@ -887,6 +949,7 @@ class MainActivity : Activity() {
             return
         }
 
+        npcAutomation?.stop("Beralih ke memancing.")
         val session = FishingSession(File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME).lastModified())
         fishingSession = session
         ScreenCaptureService.setAutomationActive(true)
@@ -1107,6 +1170,10 @@ class MainActivity : Activity() {
     }
 
     private fun prepareContinuousMode() {
+        if (npcAutomation != null) {
+            executionStatusText.text = "Matikan switch minigame NPC sebelum menjalankan mode warung."
+            return
+        }
         if (fishingSession != null) {
             executionStatusText.text = "Hentikan mode memancing sebelum memulai mode pesanan."
             return
@@ -2294,6 +2361,10 @@ class MainActivity : Activity() {
     }
 
     private fun prepareAutomaticExecution(singleItemOnly: Boolean) {
+        if (npcAutomation != null) {
+            executionStatusText.text = "Matikan switch minigame NPC sebelum menjalankan mode warung."
+            return
+        }
         if (fishingSession != null) {
             executionStatusText.text = "Hentikan mode memancing sebelum memulai uji pesanan."
             return
@@ -2537,6 +2608,10 @@ class MainActivity : Activity() {
     }
 
     private fun scheduleResumeAfterGameSwitch() {
+        if (npcAutomation != null) {
+            executionStatusText.text = "Matikan switch minigame NPC sebelum menjalankan mode warung."
+            return
+        }
         if (fishingSession != null) {
             executionStatusText.text = "Hentikan mode memancing sebelum melanjutkan pesanan."
             return
@@ -3102,6 +3177,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopScreenCapture() {
+        npcAutomation?.stop("Capture dimatikan.")
         stopFishing("Memancing dihentikan karena capture dimatikan.")
         stopContinuousMode()
         executionManager?.stop()
@@ -3274,6 +3350,10 @@ class MainActivity : Activity() {
     }
 
     private fun runOcr() {
+        if (npcAutomation != null) {
+            executionStatusText.text = "Matikan switch minigame NPC sebelum menjalankan mode warung."
+            return
+        }
         if (fishingSession != null) {
             fishingStatus.text = "Hentikan mode memancing sebelum membaca pesanan."
             return
@@ -3687,6 +3767,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        npcAutomation?.stop("Aplikasi ditutup.")
         stopFishing("Memancing dihentikan.")
         pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingStartRunnable = null
