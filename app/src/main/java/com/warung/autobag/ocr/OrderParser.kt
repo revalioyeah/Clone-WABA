@@ -313,37 +313,41 @@ object OrderParser {
         )
 
         // 6. Susun hasil dari atas ke bawah, lalu kiri ke kanan.
+        // HANYA masukkan nama barang yang memiliki pasangan jumlah pesanan.
+        // Ini mencegah label stok di rak (mis. Rengginang) dianggap sebagai
+        // pesanan hanya karena ikut terbaca di area OCR yang luas.
         val parsedItems = itemFragments.withIndex()
             .sortedWith(
                 compareBy<IndexedValue<ItemFragment>> { it.value.box.centerY }
                     .thenBy { it.value.box.centerX }
             )
-            .map { indexedItem ->
+            .mapNotNull { indexedItem ->
                 val item = indexedItem.value
                 val quantityIndex = assignments[indexedItem.index]
-                val quantity = quantityIndex?.let {
-                    quantityFragments.getOrNull(it)
-                }
+                    ?: return@mapNotNull null
+                val quantity = quantityFragments.getOrNull(quantityIndex)
+                    ?: return@mapNotNull null
 
                 ParsedOrderItem(
                     name = item.name,
-                    currentQuantity = quantity?.current,
-                    requiredQuantity = quantity?.required,
-                    rawText = if (quantity != null) {
-                        "${item.rawText} | ${quantity.rawText}"
-                    } else {
-                        item.rawText
-                    }
+                    currentQuantity = quantity.current,
+                    requiredQuantity = quantity.required,
+                    rawText = "${item.rawText} | ${quantity.rawText}"
                 )
             }
+
+        val ignoredUnpairedLabels = itemFragments.size - parsedItems.size
 
         return OrderParseResult(
             items = parsedItems,
             headerFound = true,
-            message = if (parsedItems.isEmpty()) {
-                "Papan ditemukan, tetapi item belum berhasil dipisahkan."
-            } else {
-                "${parsedItems.size} item pesanan berhasil dipisahkan."
+            message = when {
+                parsedItems.isEmpty() ->
+                    "Papan ditemukan, tetapi belum ada nama barang yang cocok dengan jumlah pesanan."
+                ignoredUnpairedLabels > 0 ->
+                    "${parsedItems.size} item pesanan berhasil dipisahkan; $ignoredUnpairedLabels label tanpa jumlah pesanan diabaikan."
+                else ->
+                    "${parsedItems.size} item pesanan berhasil dipisahkan."
             }
         )
     }
