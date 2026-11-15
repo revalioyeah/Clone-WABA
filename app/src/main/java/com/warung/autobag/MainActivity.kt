@@ -10,6 +10,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -17,6 +18,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.GradientDrawable
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
@@ -35,6 +37,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.warung.autobag.capture.ScreenCaptureService
@@ -58,6 +61,7 @@ import java.io.File
 class MainActivity : Activity() {
 
     companion object {
+        private const val MINI_GAMES_TAB = "mini_games_tab"
         private const val ACCESSIBILITY_SETUP_SHOWN = "accessibility_setup_shown"
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REQUEST_POST_NOTIFICATIONS = 3102
@@ -127,11 +131,15 @@ class MainActivity : Activity() {
     private var userPaused = false
     private var fishingSession: FishingSession? = null
     private lateinit var fishingStatus: TextView
+    private lateinit var fishingSwitch: Switch
+    private var syncingFishingSwitch = false
+    private var miniGamesTabSelected = false
 
     private class FishingSession(
         var lastFrame: Long,
         var castTapped: Boolean = false,
-        var biteTapped: Boolean = false
+        var biteTapped: Boolean = false,
+        var displayedEnergy: Int? = null
     )
 
     private val fishingEnergyPattern = Regex(
@@ -161,7 +169,7 @@ class MainActivity : Activity() {
 
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(26), dp(22), dp(24))
+            setPadding(dp(16), dp(20), dp(16), dp(24))
             setBackgroundColor(Color.rgb(246, 248, 246))
         }
 
@@ -176,23 +184,17 @@ class MainActivity : Activity() {
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
 
-        val subtitle = TextView(this).apply {
-            text = "Screen Capture, Smart Order Recognition & Item Detection\n\nAmbil gambar layar game, baca papan pesanan, lalu cari perkiraan lokasi barang pada rak."
-            textSize = 15f
-            setTextColor(Color.DKGRAY)
-        }
-
         accessibilityStatusText = TextView(this).apply {
             textSize = 14f
             setTextColor(Color.DKGRAY)
         }
 
         accessibilitySettingsButton = Button(this).apply {
-            text = "AKTIFKAN ACCESSIBILITY"
+            text = "Aktifkan Accessibility"
             setOnClickListener { openAccessibilitySettings() }
         }
 
-        val heading = createHeading("SCREEN CAPTURE CONTROL")
+        val heading = createHeading("Akses & Screen Capture")
 
         statusText = TextView(this).apply {
             text = "Status: Screen Capture belum aktif."
@@ -201,28 +203,29 @@ class MainActivity : Activity() {
         }
 
         val startButton = Button(this).apply {
-            text = "MULAI SCREEN CAPTURE"
+            text = "Mulai capture"
             setOnClickListener { requestScreenCapture() }
         }
 
         val stopButton = Button(this).apply {
-            text = "HENTIKAN SCREEN CAPTURE"
+            text = "Hentikan capture"
             setOnClickListener { stopScreenCapture() }
         }
 
         val previewButton = Button(this).apply {
-            text = "LIHAT HASIL TANGKAPAN"
+            text = "Lihat tangkapan terakhir"
             setOnClickListener { showLatestCapture() }
         }
 
         val saveButton = Button(this).apply {
-            text = "SIMPAN HASIL KE GALERI"
+            text = "Simpan ke galeri"
             setOnClickListener { saveLatestCaptureToGallery() }
         }
 
-        val previewHeading = createHeading("PREVIEW HASIL TANGKAPAN")
+        val previewHeading = createHeading("Tangkapan layar")
 
         previewImage = ImageView(this).apply {
+            visibility = View.GONE
             setBackgroundColor(Color.rgb(28, 36, 31))
             scaleType = ImageView.ScaleType.FIT_CENTER
             adjustViewBounds = true
@@ -231,19 +234,13 @@ class MainActivity : Activity() {
 
         val orderHeading = createHeading("SMART ORDER RECOGNITION")
 
-        val orderDescription = TextView(this).apply {
-            text = "Baca teks pada gambar terakhir untuk memisahkan nama barang dan jumlah pesanan pelanggan."
-            textSize = 14f
-            setTextColor(Color.DKGRAY)
-        }
-
         val ocrButton = Button(this).apply {
-            text = "BACA PESANAN & DETEKSI LOKASI"
+            text = "Pindai pesanan & lokasi barang"
             setOnClickListener { runOcr() }
         }
 
         val clearButton = Button(this).apply {
-            text = "BERSIHKAN HASIL"
+            text = "Bersihkan hasil"
             setOnClickListener {
                 orderResultText.text = "Belum ada hasil parsing pesanan."
                 detectionResultText.text = "Belum ada hasil deteksi lokasi barang."
@@ -256,7 +253,7 @@ class MainActivity : Activity() {
             }
         }
 
-        val catalogHeading = createHeading("DYNAMIC ITEM CATALOG")
+        val catalogHeading = createHeading("Katalog barang")
 
         catalogSummaryText = TextView(this).apply {
             textSize = 13f
@@ -267,11 +264,11 @@ class MainActivity : Activity() {
         refreshCatalogSummary()
 
         val manageCatalogButton = Button(this).apply {
-            text = "KELOLA / TAMBAH BARANG BARU"
+            text = "Kelola katalog barang"
             setOnClickListener { showDynamicCatalogManager() }
         }
 
-        val automationHeading = createHeading("GESTURE AUTOMATION — MODE BERKELANJUTAN")
+        val automationHeading = createHeading("Pesanan pelanggan")
 
         executionStatusText = TextView(this).apply {
             text = "Status: otomatisasi belum dijalankan."
@@ -288,17 +285,17 @@ class MainActivity : Activity() {
         }
 
         val testOneItemButton = Button(this).apply {
-            text = "UJI GESTURE — 1 BARANG"
+            text = "Uji tap satu barang"
             setOnClickListener { prepareAutomaticExecution(singleItemOnly = true) }
         }
 
         val startAutomaticButton = Button(this).apply {
-            text = "MULAI MODE OTOMATIS BERKELANJUTAN"
+            text = "Mulai mode Warung"
             setOnClickListener { prepareContinuousMode() }
         }
 
         val pauseAutomaticButton = Button(this).apply {
-            text = "PAUSE"
+            text = "Jeda"
             setOnClickListener {
                 userPaused = true
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -311,14 +308,13 @@ class MainActivity : Activity() {
         }
 
         val resumeAutomaticButton = Button(this).apply {
-            text = "LANJUTKAN"
+            text = "Lanjutkan"
             setOnClickListener { scheduleResumeAfterGameSwitch() }
         }
 
         val stopAutomaticButton = Button(this).apply {
-            text = "STOP"
+            text = "Stop"
             setOnClickListener {
-                stopFishing("Memancing dihentikan.")
                 stopContinuousMode()
                 pendingStartRunnable?.let { mainHandler.removeCallbacks(it) }
                 pendingStartRunnable = null
@@ -328,13 +324,7 @@ class MainActivity : Activity() {
             }
         }
 
-        val automationNote = TextView(this).apply {
-            text = "Mode berkelanjutan memantau pelanggan baru secara otomatis. Capture harus tetap aktif. Periksa titik hijau di tengah setiap produk sebelum mulai. Permintaan utang yang dikenali diterima otomatis. Jika dialog lain menghalangi pesanan, aplikasi menunggu panel kembali."
-            textSize = 12f
-            setTextColor(Color.DKGRAY)
-        }
-
-        val parsedHeading = createHeading("HASIL PESANAN TERSTRUKTUR")
+        val parsedHeading = createHeading("Hasil pesanan")
 
         orderResultText = TextView(this).apply {
             text = "Belum ada hasil parsing pesanan."
@@ -347,7 +337,7 @@ class MainActivity : Activity() {
             setTextIsSelectable(true)
         }
 
-        val detectionHeading = createHeading("SMART ITEM DETECTION")
+        val detectionHeading = createHeading("Lokasi barang")
 
         detectionResultText = TextView(this).apply {
             text = "Belum ada hasil deteksi lokasi barang."
@@ -360,7 +350,7 @@ class MainActivity : Activity() {
             setTextIsSelectable(true)
         }
 
-        val rawHeading = createHeading("DIAGNOSTIK OCR")
+        val rawHeading = createHeading("Teks OCR")
 
         ocrResultText = TextView(this).apply {
             text = "Belum ada hasil OCR."
@@ -371,97 +361,162 @@ class MainActivity : Activity() {
             setTextIsSelectable(true)
         }
 
-        val instruction = TextView(this).apply {
-            text = """
-                PETUNJUK PENGGUNAAN
+        page.addView(title, marginParams(14))
 
-                1. Tekan MULAI SCREEN CAPTURE.
-                2. Setujui izin perekaman layar Android.
-                3. Pindah ke Warung Life Simulator.
-                4. Tunggu sampai papan pesanan pelanggan terlihat.
-                5. Biarkan Screen Capture tetap aktif.
-                6. Kembali ke aplikasi assistant dengan mengetuk notifikasi Warung Auto Bag Assistant.
-                7. Tekan BACA PESANAN & DETEKSI LOKASI untuk pemeriksaan kalibrasi awal.
-                8. Periksa hasil OCR dan pastikan setiap penanda hijau berada di tengah gambar produk.
-                9. Centang konfirmasi kalibrasi.
-                10. Tekan MULAI MODE OTOMATIS BERKELANJUTAN.
-                11. Pindah ke game dalam 1,5 detik. Aplikasi akan memantau pelanggan berikutnya sampai STOP ditekan.
+        val setup = sectionCard()
+        setup.addView(heading, marginParams(8))
+        setup.addView(accessibilityStatusText, marginParams(4))
+        setup.addView(accessibilitySettingsButton, marginParams(4))
+        setup.addView(statusText, marginParams(6))
+        setup.addView(controlRow(startButton, stopButton), marginParams())
+        page.addView(setup, marginParams(14))
 
-                CATATAN PENTING:
-                - Titik hijau di tengah produk harus diperiksa sebelum mode otomatis dijalankan.
-                - Hingga ${TargetGameConfig.MAX_ITEM_TYPES_PER_SEQUENCE} jenis barang diproses berurutan sebelum satu verifikasi OCR panel.
-                - Jika jumlah salah satu barang tidak cocok, antrean dijeda dan tidak mengulang tap secara otomatis.
-                - Permintaan utang yang dikenali akan ditangani dengan tombol Kasih utang. Interupsi lain bisa diselesaikan manual di game.
-                - Tombol STOP mengakhiri seluruh sesi otomatis.
-            """.trimIndent()
-            textSize = 13f
-            setTextColor(Color.DKGRAY)
+        val warungTab = Button(this).apply { text = "Warung" }
+        val miniGamesTab = Button(this).apply { text = "Mini Game" }
+        page.addView(controlRow(warungTab, miniGamesTab), marginParams(10))
+
+        val warungPage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val miniGamesPage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(warungPage, marginParams())
+        page.addView(miniGamesPage, marginParams())
+
+        fun selectTab(showMiniGames: Boolean) {
+            miniGamesTabSelected = showMiniGames
+            warungPage.visibility = if (showMiniGames) View.GONE else View.VISIBLE
+            miniGamesPage.visibility = if (showMiniGames) View.VISIBLE else View.GONE
+            styleControl(warungTab, primary = !showMiniGames)
+            styleControl(miniGamesTab, primary = showMiniGames)
+            warungTab.isSelected = !showMiniGames
+            miniGamesTab.isSelected = showMiniGames
         }
 
-        page.addView(title, marginParams(8))
-        page.addView(subtitle, marginParams(12))
-        page.addView(accessibilityStatusText, marginParams(6))
-        page.addView(accessibilitySettingsButton, marginParams(12))
+        warungTab.setOnClickListener { selectTab(false) }
+        miniGamesTab.setOnClickListener { selectTab(true) }
+        selectTab(savedInstanceState?.getBoolean(MINI_GAMES_TAB) ?: false)
 
-        page.addView(heading, marginParams(12))
-        page.addView(statusText, marginParams(12))
-        page.addView(startButton, marginParams(8))
-        page.addView(stopButton, marginParams(8))
-        page.addView(previewButton, marginParams(8))
-        page.addView(saveButton, marginParams(22))
+        val orders = sectionCard()
+        orders.addView(automationHeading, marginParams(4))
+        orders.addView(executionStatusText, marginParams(6))
+        orders.addView(ocrButton, marginParams(6))
+        orders.addView(previewImage, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(160)
+        ).apply { bottomMargin = dp(6) })
+        orders.addView(calibrationCheckBox, marginParams(8))
+        orders.addView(startAutomaticButton, marginParams(4))
+        orders.addView(controlRow(pauseAutomaticButton, resumeAutomaticButton, stopAutomaticButton), marginParams())
+        warungPage.addView(orders, marginParams(10))
 
-        page.addView(previewHeading, marginParams(10))
-        page.addView(
-            previewImage,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(180)
-            ).apply {
-                bottomMargin = dp(22)
+        val details = sectionCard().apply { visibility = View.GONE }
+        val detailsButton = Button(this).apply {
+            text = "Alat & diagnostik"
+            setOnClickListener {
+                val expand = details.visibility != View.VISIBLE
+                details.visibility = if (expand) View.VISIBLE else View.GONE
+                text = if (expand) "Tutup alat & diagnostik" else "Alat & diagnostik"
             }
-        )
-
-        page.addView(orderHeading, marginParams(10))
-        page.addView(orderDescription, marginParams(8))
-        page.addView(ocrButton, marginParams(8))
-        page.addView(clearButton, marginParams(12))
-        page.addView(catalogHeading, marginParams(10))
-        page.addView(catalogSummaryText, marginParams(6))
-        page.addView(manageCatalogButton, marginParams(8))
-        page.addView(automationHeading, marginParams(10))
-        page.addView(executionStatusText, marginParams(8))
-        page.addView(calibrationCheckBox, marginParams(8))
-        page.addView(testOneItemButton, marginParams(6))
-        page.addView(startAutomaticButton, marginParams(6))
-        page.addView(pauseAutomaticButton, marginParams(6))
-        page.addView(resumeAutomaticButton, marginParams(6))
-        page.addView(stopAutomaticButton, marginParams(6))
-        page.addView(automationNote, marginParams(14))
-        page.addView(createHeading("MEMANCING OTOMATIS"), marginParams(8))
-        fishingStatus = TextView(this).apply {
-            text = "Buka mini game Memancing di Sungai. Mode berhenti saat energi di bawah 20%."
         }
-        page.addView(fishingStatus, marginParams(8))
-        page.addView(Button(this).apply {
-            text = "MULAI MEMANCING OTOMATIS"
-            setOnClickListener { startFishing() }
-        }, marginParams(6))
-        page.addView(Button(this).apply {
-            text = "STOP MEMANCING"
-            setOnClickListener { stopFishing("Memancing dihentikan.") }
-        }, marginParams(14))
-        page.addView(parsedHeading, marginParams(12))
-        page.addView(orderResultText, marginParams(18))
-        page.addView(detectionHeading, marginParams(12))
-        page.addView(detectionResultText, marginParams(18))
-        page.addView(rawHeading, marginParams(12))
-        page.addView(ocrResultText, marginParams(18))
-        page.addView(instruction, marginParams())
+        warungPage.addView(detailsButton, marginParams(6))
+        details.addView(previewHeading, marginParams(4))
+        details.addView(previewButton, marginParams(4))
+        details.addView(saveButton, marginParams(4))
+        details.addView(clearButton, marginParams(4))
+        details.addView(testOneItemButton, marginParams(10))
+        details.addView(catalogHeading, marginParams(4))
+        details.addView(catalogSummaryText, marginParams(4))
+        details.addView(manageCatalogButton, marginParams(10))
+        details.addView(parsedHeading, marginParams(4))
+        details.addView(orderResultText, marginParams(10))
+        details.addView(detectionHeading, marginParams(4))
+        details.addView(detectionResultText, marginParams(10))
+        details.addView(rawHeading, marginParams(4))
+        details.addView(ocrResultText, marginParams())
+        warungPage.addView(details, marginParams())
+
+        fishingStatus = TextView(this).apply {
+            text = "Berhenti otomatis saat energi di bawah 20%."
+            textSize = 14f
+            setTextColor(Color.rgb(64, 83, 74))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        fishingSwitch = addMiniGameCard(miniGamesPage, "Memancing di Sungai", fishingStatus) { enabled ->
+            if (!syncingFishingSwitch) {
+                if (enabled) startFishing() else stopFishing("Memancing dihentikan.")
+                syncFishingSwitch()
+            }
+        }
+
+        listOf(
+            accessibilitySettingsButton, stopButton, previewButton, saveButton, clearButton,
+            manageCatalogButton, testOneItemButton, pauseAutomaticButton, resumeAutomaticButton,
+            stopAutomaticButton, detailsButton
+        ).forEach { styleControl(it) }
+        listOf(startButton, ocrButton, startAutomaticButton).forEach { styleControl(it, primary = true) }
 
         setContentView(scrollView)
         createExecutionManager()
     }
 
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(MINI_GAMES_TAB, miniGamesTabSelected)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun sectionCard(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        background = GradientDrawable().apply {
+            setColor(Color.WHITE)
+            cornerRadius = dp(16).toFloat()
+            setStroke(dp(1), Color.rgb(215, 229, 220))
+        }
+    }
+
+    private fun controlRow(vararg controls: Button): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        controls.forEachIndexed { index, button ->
+            addView(button, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                if (index > 0) marginStart = dp(6)
+            })
+        }
+    }
+
+    private fun styleControl(button: Button, primary: Boolean = false) {
+        button.isAllCaps = false
+        button.textSize = 14f
+        button.minimumHeight = dp(48)
+        button.setTextColor(if (primary) Color.WHITE else Color.rgb(25, 65, 38))
+        button.backgroundTintList = ColorStateList.valueOf(
+            if (primary) Color.rgb(27, 96, 66) else Color.rgb(228, 239, 232)
+        )
+    }
+
+    private fun addMiniGameCard(
+        parent: LinearLayout,
+        title: String,
+        status: TextView,
+        onToggle: (Boolean) -> Unit
+    ): Switch {
+        val card = sectionCard()
+        val toggle = Switch(this).apply {
+            text = title
+            textSize = 18f
+            setTextColor(Color.rgb(25, 65, 38))
+            minimumHeight = dp(48)
+            isSaveEnabled = false
+            setOnCheckedChangeListener { _, checked -> onToggle(checked) }
+        }
+        card.addView(toggle, marginParams(4))
+        card.addView(status, marginParams())
+        parent.addView(card, marginParams(10))
+        return toggle
+    }
+
+    private fun syncFishingSwitch() {
+        syncingFishingSwitch = true
+        fishingSwitch.isChecked = fishingSession != null
+        syncingFishingSwitch = false
+    }
 
     override fun onResume() {
         super.onResume()
@@ -652,7 +707,7 @@ class MainActivity : Activity() {
                 refreshCatalogSummary()
                 Toast.makeText(
                     this,
-                    "Barang tersimpan. Tekan BACA PESANAN & DETEKSI LOKASI untuk memperbarui titik target.",
+                    "Barang tersimpan. Tekan Pindai pesanan & lokasi barang untuk memperbarui titik target.",
                     Toast.LENGTH_LONG
                 ).show()
                 dialog.dismiss()
@@ -837,6 +892,7 @@ class MainActivity : Activity() {
     private fun stopFishing(message: String) {
         if (fishingSession == null) return
         fishingSession = null
+        syncFishingSwitch()
         ScreenCaptureService.setAutomationActive(false)
         fishingStatus.text = message
         updateCaptureNotification("MEMANCING • $message")
@@ -941,6 +997,10 @@ class MainActivity : Activity() {
             stopFishing("Energi $energy%. Memancing otomatis berhenti.")
             return
         }
+        if (session.displayedEnergy != energy) {
+            session.displayedEnergy = energy
+            fishingStatus.text = "Memancing aktif · Energi $energy%"
+        }
         if (System.currentTimeMillis() - captureModifiedAt !in 0L..450L ||
             GestureAccessibilityService.instance?.isTargetGameForeground() != true
         ) return
@@ -1032,7 +1092,7 @@ class MainActivity : Activity() {
             return
         }
         if (latestDetection == null || latestImageWidth <= 0 || latestImageHeight <= 0) {
-            executionStatusText.text = "Lakukan BACA PESANAN & DETEKSI LOKASI minimal sekali untuk mengisi cache lokasi produk sebelum mode berkelanjutan."
+            executionStatusText.text = "Lakukan Pindai pesanan & lokasi barang minimal sekali untuk mengisi cache lokasi produk sebelum mode berkelanjutan."
             return
         }
         if (!ScreenCaptureService.isRunning) {
@@ -1051,7 +1111,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Mulai mode otomatis berkelanjutan")
             .setMessage(
-                "Aplikasi akan memantau panel PESANAN, membaca pelanggan baru, mendeteksi lokasi barang, lalu menyelesaikan pesanan satu per satu. Setelah menekan MULAI, pindah ke game dalam 1,5 detik. Permintaan utang yang dikenali akan diterima otomatis. Mode tetap aktif sampai kamu menekan STOP.\n\nPastikan BACA PESANAN & DETEKSI LOKASI sudah dijalankan agar cache lokasi seluruh rak tersedia. Periksa titik hijau pada preview; titik kantong tidak diperlukan."
+                "Setelah menekan Mulai, pindah ke game dalam 1,5 detik. Permintaan utang yang dikenali akan diterima otomatis."
             )
             .setNegativeButton("BATAL", null)
             .setPositiveButton("MULAI") { _, _ ->
@@ -3020,6 +3080,7 @@ class MainActivity : Activity() {
     }
 
     private fun setDisplayedBitmap(bitmap: Bitmap) {
+        previewImage.visibility = View.VISIBLE
         previewImage.setImageDrawable(null)
 
         displayedBitmap?.let { oldBitmap ->
