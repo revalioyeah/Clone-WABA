@@ -21,17 +21,22 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import com.warung.autobag.capture.ScreenCaptureService
 import com.warung.autobag.detection.SmartDetectionResult
 import com.warung.autobag.detection.SmartDetectedItem
 import com.warung.autobag.detection.ItemCatalog
+import com.warung.autobag.detection.DynamicItemCatalog
+import com.warung.autobag.detection.ShelfRegion
 import com.warung.autobag.detection.SmartItemDetector
 import com.warung.autobag.gesture.GestureAccessibilityService
 import com.warung.autobag.gesture.GestureController
@@ -78,6 +83,7 @@ class MainActivity : Activity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var executionManager: OrderExecutionManager? = null
     private lateinit var executionStatusText: TextView
+    private lateinit var catalogSummaryText: TextView
     private lateinit var calibrationCheckBox: CheckBox
     private var latestParsedOrder: OrderParseResult? = null
     private var latestDetection: SmartDetectionResult? = null
@@ -105,6 +111,7 @@ class MainActivity : Activity() {
     // Shelf locations are stable across customers while the game layout and
     // screenshot dimensions remain unchanged. Seeded by the initial full OCR.
     private val cachedProductLocations = mutableMapOf<String, SmartDetectedItem>()
+    private var catalogEntriesCache: List<com.warung.autobag.detection.CatalogEntry>? = null
     private var cachedLocationImageWidth = 0
     private var cachedLocationImageHeight = 0
     private var cachedLocationUpdatedAt = 0L
@@ -212,6 +219,21 @@ class MainActivity : Activity() {
                 statusText.text = "Hasil pembacaan telah dibersihkan."
                 showLatestCapture()
             }
+        }
+
+        val catalogHeading = createHeading("DYNAMIC ITEM CATALOG")
+
+        catalogSummaryText = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.DKGRAY)
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        refreshCatalogSummary()
+
+        val manageCatalogButton = Button(this).apply {
+            text = "KELOLA / TAMBAH BARANG BARU"
+            setOnClickListener { showDynamicCatalogManager() }
         }
 
         val automationHeading = createHeading("GESTURE AUTOMATION — MODE BERKELANJUTAN")
@@ -365,6 +387,9 @@ class MainActivity : Activity() {
         page.addView(orderDescription, marginParams(8))
         page.addView(ocrButton, marginParams(8))
         page.addView(clearButton, marginParams(12))
+        page.addView(catalogHeading, marginParams(10))
+        page.addView(catalogSummaryText, marginParams(6))
+        page.addView(manageCatalogButton, marginParams(8))
         page.addView(automationHeading, marginParams(10))
         page.addView(executionStatusText, marginParams(8))
         page.addView(calibrationCheckBox, marginParams(8))
@@ -386,6 +411,170 @@ class MainActivity : Activity() {
         createExecutionManager()
     }
 
+
+    private fun currentCatalogEntries(): List<com.warung.autobag.detection.CatalogEntry> {
+        return catalogEntriesCache ?: DynamicItemCatalog.allEntries(this).also {
+            catalogEntriesCache = it
+        }
+    }
+
+    private fun reloadCatalogEntries() {
+        catalogEntriesCache = DynamicItemCatalog.allEntries(this)
+    }
+
+    private fun refreshCatalogSummary() {
+        if (!::catalogSummaryText.isInitialized) return
+        val custom = DynamicItemCatalog.customEntries(this)
+        val total = ItemCatalog.entries.size + custom.size
+        catalogSummaryText.text = buildString {
+            append("Katalog bawaan: ${ItemCatalog.entries.size} barang\n")
+            append("Barang tambahan tersimpan: ${custom.size}\n")
+            append("Total barang dikenali: $total")
+            if (custom.isNotEmpty()) {
+                append("\n\nTambahan: ")
+                append(custom.joinToString(", ") { it.name })
+            }
+        }
+    }
+
+    private fun showDynamicCatalogManager() {
+        val custom = DynamicItemCatalog.customEntries(this)
+        val labels = custom.map { "${it.name} — ${shelfRegionLabel(it.shelfRegion)}" }.toTypedArray()
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Dynamic Item Catalog")
+            .setMessage(
+                if (custom.isEmpty()) {
+                    "Belum ada barang tambahan. Tambahkan nama barang, alias OCR, dan wilayah rak agar bisa dikenali tanpa mengubah kode aplikasi."
+                } else {
+                    "Pilih barang tambahan untuk menghapusnya, atau tambahkan produk baru."
+                }
+            )
+            .setItems(labels) { _, which ->
+                val selected = custom.getOrNull(which) ?: return@setItems
+                AlertDialog.Builder(this)
+                    .setTitle("Hapus ${selected.name}?")
+                    .setMessage("Barang ini akan dihapus dari katalog tambahan lokal.")
+                    .setNegativeButton("Batal", null)
+                    .setPositiveButton("Hapus") { _, _ ->
+                        if (DynamicItemCatalog.remove(this, selected.name)) {
+                            reloadCatalogEntries()
+                            cachedProductLocations.clear()
+                            cachedLocationUpdatedAt = 0L
+                            calibrationCheckBox.isChecked = false
+                            refreshCatalogSummary()
+                            Toast.makeText(this, "${selected.name} dihapus. Lakukan OCR ulang.", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                    .show()
+            }
+            .setNegativeButton("Tutup", null)
+            .setPositiveButton("Tambah barang", null)
+
+        val dialog = builder.create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                dialog.dismiss()
+                showAddDynamicItemDialog()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun showAddDynamicItemDialog() {
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(8), dp(22), dp(4))
+        }
+
+        fun field(hintText: String, initial: String = ""): EditText = EditText(this).apply {
+            hint = hintText
+            setSingleLine(true)
+            setText(initial)
+        }
+
+        val nameInput = field("Nama barang (contoh: Tisu wajah)")
+        val aliasInput = field("Alias OCR, pisahkan dengan koma (opsional)")
+        val offsetInput = field("Offset titik target (10–180 px)", "55").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
+        val regionSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_item,
+                listOf("Rak kiri — Dapur & Rumah Tangga", "Rak kanan — Minuman & Camilan", "Konter pulsa")
+            ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+        }
+
+        form.addView(nameInput)
+        form.addView(aliasInput)
+        val regionLabel = TextView(this).apply {
+            text = "Wilayah barang"
+            textSize = 13f
+            setTextColor(Color.DKGRAY)
+            setPadding(0, dp(8), 0, 0)
+        }
+        form.addView(regionLabel)
+        form.addView(regionSpinner)
+        form.addView(offsetInput)
+        val note = TextView(this).apply {
+            text = "Catatan: offset 55 px adalah perkiraan awal. Setelah menyimpan, lakukan OCR dan periksa titik hijau pada preview sebelum mengaktifkan gesture."
+            textSize = 12f
+            setTextColor(Color.DKGRAY)
+        }
+        form.addView(note)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Tambah barang baru")
+            .setView(form)
+            .setNegativeButton("Batal", null)
+            .setPositiveButton("Simpan", null)
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val region = when (regionSpinner.selectedItemPosition) {
+                    1 -> ShelfRegion.RIGHT_SHELF
+                    2 -> ShelfRegion.PULSE_COUNTER
+                    else -> ShelfRegion.LEFT_SHELF
+                }
+                val offset = offsetInput.text.toString().trim().toIntOrNull()
+                if (offset == null) {
+                    offsetInput.error = "Masukkan offset angka 10–180"
+                    return@setOnClickListener
+                }
+                val error = DynamicItemCatalog.add(
+                    context = this,
+                    nameInput = nameInput.text.toString(),
+                    aliasInput = aliasInput.text.toString(),
+                    shelfRegion = region,
+                    targetOffsetYReferencePx = offset
+                )
+                if (error != null) {
+                    Toast.makeText(this, error, Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+
+                reloadCatalogEntries()
+                cachedProductLocations.clear()
+                cachedLocationUpdatedAt = 0L
+                calibrationCheckBox.isChecked = false
+                refreshCatalogSummary()
+                Toast.makeText(
+                    this,
+                    "Barang tersimpan. Tekan BACA PESANAN & DETEKSI LOKASI untuk memperbarui titik target.",
+                    Toast.LENGTH_LONG
+                ).show()
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun shelfRegionLabel(region: ShelfRegion): String = when (region) {
+        ShelfRegion.LEFT_SHELF -> "Rak kiri"
+        ShelfRegion.RIGHT_SHELF -> "Rak kanan"
+        ShelfRegion.PULSE_COUNTER -> "Konter pulsa"
+    }
 
     private fun updateCaptureNotification(status: String) {
         if (ScreenCaptureService.isRunning) {
@@ -708,7 +897,7 @@ class MainActivity : Activity() {
                     if (usingPanelCrop && !scanBitmap.isRecycled) {
                         scanBitmap.recycle()
                     }
-                    val parsed = OrderParser.parse(result)
+                    val parsed = OrderParser.parse(result, currentCatalogEntries())
 
                     runOnUiThread {
                         if (!continuousModeEnabled || isFinishing || isDestroyed) {
@@ -1005,7 +1194,7 @@ class MainActivity : Activity() {
                     isOcrRunning = false
                     if (!continuousModeEnabled || isFinishing || isDestroyed) return@recognize
 
-                    val parsed = OrderParser.parse(result)
+                    val parsed = OrderParser.parse(result, currentCatalogEntries())
                     updateVerificationRegion(result, imageWidth, imageHeight)
                     rememberProductLocationCache(result, imageWidth, imageHeight)
                     handleContinuousScanResult(
@@ -1230,7 +1419,8 @@ class MainActivity : Activity() {
             ocrResult = result,
             orders = parsed.items,
             imageWidth = imageWidth,
-            imageHeight = imageHeight
+            imageHeight = imageHeight,
+            catalogEntries = currentCatalogEntries()
         )
         val tasks = buildTasksFromSnapshot(parsed, detection, singleItemOnly = false)
         if (tasks == null) {
@@ -1306,7 +1496,7 @@ class MainActivity : Activity() {
             cachedProductLocations.clear()
         }
 
-        val catalogOrders = ItemCatalog.entries.map { entry ->
+        val catalogOrders = currentCatalogEntries().map { entry ->
             ParsedOrderItem(
                 name = entry.name,
                 currentQuantity = 0,
@@ -1319,7 +1509,8 @@ class MainActivity : Activity() {
             ocrResult = ocrResult,
             orders = catalogOrders,
             imageWidth = imageWidth,
-            imageHeight = imageHeight
+            imageHeight = imageHeight,
+            catalogEntries = currentCatalogEntries()
         )
 
         allLocations.detections.forEach { detected ->
@@ -1619,13 +1810,14 @@ class MainActivity : Activity() {
                     if (!bitmap.isRecycled) bitmap.recycle()
                     isOcrRunning = false
 
-                    val parsed = OrderParser.parse(result)
+                    val parsed = OrderParser.parse(result, currentCatalogEntries())
                     updateVerificationRegion(result, imageWidth, imageHeight)
                     val detection = SmartItemDetector.detect(
                         ocrResult = result,
                         orders = parsed.items,
                         imageWidth = imageWidth,
-                        imageHeight = imageHeight
+                        imageHeight = imageHeight,
+                        catalogEntries = currentCatalogEntries()
                     )
                     rememberProductLocationCache(result, imageWidth, imageHeight, force = true)
                     latestParsedOrder = parsed
@@ -1851,7 +2043,7 @@ class MainActivity : Activity() {
                         inputBitmap.recycle()
                     }
 
-                    val parsed = OrderParser.parse(result)
+                    val parsed = OrderParser.parse(result, currentCatalogEntries())
                     val missingTargets = pending.items.filter { target ->
                         parsed.items.none { item ->
                             normalizeItemName(item.name) == normalizeItemName(target.itemName) &&
@@ -1929,7 +2121,7 @@ class MainActivity : Activity() {
                     isVerificationOcrRunning = false
                     if (pendingVerification !== pending) return@recognize
                     updateVerificationRegion(result, width, height)
-                    processVerificationResult(pending, OrderParser.parse(result))
+                    processVerificationResult(pending, OrderParser.parse(result, currentCatalogEntries()))
                 },
                 onFailure = { exception ->
                     if (!bitmap.isRecycled) bitmap.recycle()
@@ -2460,14 +2652,15 @@ class MainActivity : Activity() {
                 onSuccess = { result ->
 
                     // Parser dan detector memakai hasil OCR yang sama.
-                    val parsed = OrderParser.parse(result)
+                    val parsed = OrderParser.parse(result, currentCatalogEntries())
                     updateVerificationRegion(result, imageWidth, imageHeight)
 
                     val detection = SmartItemDetector.detect(
                         ocrResult = result,
                         orders = parsed.items,
                         imageWidth = imageWidth,
-                        imageHeight = imageHeight
+                        imageHeight = imageHeight,
+                        catalogEntries = currentCatalogEntries()
                     )
                     rememberProductLocationCache(result, imageWidth, imageHeight, force = true)
 
