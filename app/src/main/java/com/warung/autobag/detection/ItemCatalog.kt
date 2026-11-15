@@ -150,6 +150,31 @@ object ItemCatalog {
             targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
         ),
 
+        CatalogEntry(
+            name = "Minyak goreng",
+            aliases = listOf("Minyak goreng", "Minyakgoreng"),
+            shelfRegion = ShelfRegion.LEFT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+        CatalogEntry(
+            name = "Sabun mandi",
+            aliases = listOf("Sabun mandi", "Sabunmandi"),
+            shelfRegion = ShelfRegion.LEFT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+        CatalogEntry(
+            name = "Deterjen",
+            aliases = listOf("Deterjen", "Detergen"),
+            shelfRegion = ShelfRegion.LEFT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+        CatalogEntry(
+            name = "Tisu",
+            aliases = listOf("Tisu", "Tissue", "Tisu wajah"),
+            shelfRegion = ShelfRegion.LEFT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+
         // ---------------------------------------------------------
         // RAK KANAN: MINUMAN & CAMILAN
         // ---------------------------------------------------------
