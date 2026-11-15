@@ -115,6 +115,8 @@ object OrderParser {
         val aliasLength: Int
     )
 
+    private val aliasWhitespace = Regex("""\s+""")
+
     @Volatile
     private var cachedCatalogSnapshot: List<CatalogEntry> = emptyList()
 
@@ -140,12 +142,13 @@ object OrderParser {
     ): List<CompiledCatalogAlias> = catalogEntries
         .flatMap { entry ->
             (listOf(entry.name) + entry.aliases)
-                .distinctBy(::normalize)
+                // Pertahankan bentuk seperti "2GB" dan "2 GB".
+                .map { it.trim().replace(aliasWhitespace, " ") }
+                .distinctBy { it.uppercase() }
                 .filter { it.isNotBlank() }
                 .map { alias ->
                     val flexiblePattern = alias
-                        .trim()
-                        .split(Regex("""\s+"""))
+                        .split(' ')
                         .joinToString("""\s+""") { Regex.escape(it) }
 
                     CompiledCatalogAlias(
