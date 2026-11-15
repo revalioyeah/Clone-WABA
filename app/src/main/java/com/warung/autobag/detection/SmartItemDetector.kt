@@ -127,7 +127,7 @@ object SmartItemDetector {
              * label diestimasi dari rentang karakter pada bounding box
              * baris OCR.
              */
-            val candidates = ocrResult.lines.mapNotNull { line ->
+            val candidates = ocrResult.lines.flatMap lineLoop@{ line ->
 
                 val validElements = line.elements
                     .filter { it.text.isNotBlank() }
@@ -157,45 +157,64 @@ object SmartItemDetector {
                     )
                 }
 
-                val searchableText = if (builder.isNotEmpty()) {
-                    builder.toString()
-                } else {
-                    line.text
+                val elementText = builder.toString()
+                val textSources = mutableListOf<Pair<String, List<TextSpan>>>()
+
+                if (elementText.isNotBlank()) {
+                    textSources.add(elementText to spans)
                 }
 
-                val match = findAliasRange(
-                    text = searchableText,
-                    aliases = catalogEntry.aliases + catalogEntry.name
-                ) ?: return@mapNotNull null
-
-                val matchedBox = boundsForMatch(
-                    text = searchableText,
-                    match = match,
-                    spans = spans,
-                    fallback = LabelBox(
-                        left = line.left,
-                        top = line.top,
-                        right = line.right,
-                        bottom = line.bottom
-                    )
-                )
-
-                val xRatio = matchedBox.centerX / imageWidth.toFloat()
-                val yRatio = matchedBox.centerY / imageHeight.toFloat()
-
-                if (xRatio !in region.minXRatio..region.maxXRatio ||
-                    yRatio !in region.minYRatio..region.maxYRatio
+                // ML Kit's line.text can be more accurate than element.text
+                // for small labels such as "2 GB" on the pulse-counter cards.
+                if (
+                    line.text.isNotBlank() &&
+                    !line.text.equals(elementText, ignoreCase = true)
                 ) {
-                    return@mapNotNull null
+                    textSources.add(line.text to emptyList())
                 }
 
-                LabelCandidate(
-                    text = searchableText.substring(
-                        match.start,
-                        match.endExclusive
-                    ),
-                    box = matchedBox
-                )
+                if (textSources.isEmpty() && line.text.isNotBlank()) {
+                    textSources.add(line.text to emptyList())
+                }
+
+                textSources.mapNotNull textLoop@{ source ->
+                    val searchableText = source.first
+                    val sourceSpans = source.second
+
+                    val match = findAliasRange(
+                        text = searchableText,
+                        aliases = catalogEntry.aliases + catalogEntry.name
+                    ) ?: return@textLoop null
+
+                    val matchedBox = boundsForMatch(
+                        text = searchableText,
+                        match = match,
+                        spans = sourceSpans,
+                        fallback = LabelBox(
+                            left = line.left,
+                            top = line.top,
+                            right = line.right,
+                            bottom = line.bottom
+                        )
+                    )
+
+                    val xRatio = matchedBox.centerX / imageWidth.toFloat()
+                    val yRatio = matchedBox.centerY / imageHeight.toFloat()
+
+                    if (xRatio !in region.minXRatio..region.maxXRatio ||
+                        yRatio !in region.minYRatio..region.maxYRatio
+                    ) {
+                        return@textLoop null
+                    }
+
+                    LabelCandidate(
+                        text = searchableText.substring(
+                            match.start,
+                            match.endExclusive
+                        ),
+                        box = matchedBox
+                    )
+                }
             }
 
             // Pilih bounding box label yang paling spesifik, bukan
@@ -203,9 +222,17 @@ object SmartItemDetector {
             // Jika OCR menangkap dua teks untuk produk yang sama (umum
             // pada paket data: tulisan di ikon dan label di bawah ikon),
             // pilih label paling bawah karena itulah label nama produk.
-            val matched = candidates.maxByOrNull { candidate ->
-                candidate.box.centerY
-            }
+            val matched = candidates.maxWithOrNull(
+                compareBy<LabelCandidate> { candidate ->
+                    val width = candidate.box.right - candidate.box.left
+                    val height = candidate.box.bottom - candidate.box.top
+                    // A compact label is preferable to a wide OCR line
+                    // containing price, icon text, and neighboring products.
+                    -(width.toFloat() / height.coerceAtLeast(1))
+                }.thenBy { candidate ->
+                    candidate.box.centerY
+                }
+            )
 
             if (matched == null) {
                 notFound.add(order.name)
