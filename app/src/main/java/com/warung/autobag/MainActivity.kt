@@ -993,17 +993,142 @@ class MainActivity : Activity() {
      * Panel pesanan dipindai lebih dahulu. OCR seluruh layar hanya dipanggil
      * ketika panel menunjukkan pesanan baru atau posisi panel perlu dicari ulang.
      */
+    private fun shouldExpandPanelScan(
+        panelOcrResult: OcrResult,
+        parsed: OrderParseResult
+    ): Boolean {
+        if (parsed.items.size < 2) return false
+        val quantitiesComplete = parsed.items.all { item ->
+            item.currentQuantity != null &&
+                item.requiredQuantity != null &&
+                item.requiredQuantity > 0
+        }
+        if (!quantitiesComplete) return false
+
+        val cropHeight = verificationRegion?.height() ?: return false
+        val quantityLinePattern = Regex("""[0-9Oo]+\s*[/|]\s*[0-9]+""")
+        val nearCropBottom = panelOcrResult.lines.any { line ->
+            line.text.isNotBlank() &&
+                line.bottom >= (cropHeight * 0.72f).toInt() &&
+                quantityLinePattern.containsMatchIn(line.text)
+        }
+        return parsed.items.size >= 4 || (parsed.items.size >= 2 && nearCropBottom)
+    }
+
+    private fun runExpandedPanelScan(
+        fullBitmap: Bitmap,
+        captureModifiedAt: Long
+    ) {
+        val baseRect = verificationRegion?.let { Rect(it) }
+        if (
+            baseRect == null ||
+            baseRect.left < 0 ||
+            baseRect.top < 0 ||
+            baseRect.right > fullBitmap.width ||
+            baseRect.bottom > fullBitmap.height ||
+            baseRect.width() <= 0 ||
+            baseRect.height() <= 0
+        ) {
+            runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+            return
+        }
+
+        // Add only the missing lower portion: compact crop + 270px reaches
+        // the 0.3.10/0.3.12 long-order coverage without enlarging every scan.
+        val expandedBottom = (baseRect.bottom + 270).coerceAtMost(fullBitmap.height)
+        if (expandedBottom <= baseRect.bottom) {
+            runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+            return
+        }
+
+        val expandedBitmap = try {
+            Bitmap.createBitmap(
+                fullBitmap,
+                baseRect.left,
+                baseRect.top,
+                baseRect.width(),
+                expandedBottom - baseRect.top
+            )
+        } catch (_: Exception) {
+            runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+            return
+        }
+
+        executionStatusText.text =
+            "Pesanan panjang terdeteksi. Memperluas area OCR satu kali untuk membaca seluruh item."
+        updateCaptureNotification("SCANNING • Memperluas panel pesanan")
+
+        val recognizer = textRecognizer
+            ?: OrderTextRecognizer().also { textRecognizer = it }
+
+        try {
+            recognizer.recognize(
+                bitmap = expandedBitmap,
+                onSuccess = { expandedResult ->
+                    if (!expandedBitmap.isRecycled) expandedBitmap.recycle()
+                    val expandedParsed =
+                        OrderParser.parse(expandedResult, currentCatalogEntries())
+
+                    runOnUiThread {
+                        if (!continuousModeEnabled || isFinishing || isDestroyed) {
+                            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                            continuousScanInFlight = false
+                            isOcrRunning = false
+                            return@runOnUiThread
+                        }
+
+                        handleContinuousPanelScanResult(
+                            panelOcrResult = expandedResult,
+                            parsed = expandedParsed,
+                            fullBitmap = fullBitmap,
+                            captureModifiedAt = captureModifiedAt,
+                            expandedScan = true
+                        )
+                    }
+                },
+                onFailure = { exception ->
+                    if (!expandedBitmap.isRecycled) expandedBitmap.recycle()
+                    runOnUiThread {
+                        if (!continuousModeEnabled || isFinishing || isDestroyed) {
+                            if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                            continuousScanInFlight = false
+                            isOcrRunning = false
+                            return@runOnUiThread
+                        }
+                        executionStatusText.text =
+                            "OCR panel panjang gagal (${exception.message ?: "tidak diketahui"}). Beralih ke pemindaian penuh."
+                        runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+                    }
+                }
+            )
+        } catch (exception: Exception) {
+            if (!expandedBitmap.isRecycled) expandedBitmap.recycle()
+            executionStatusText.text =
+                "OCR panel panjang gagal (${exception.message ?: "tidak diketahui"}). Beralih ke pemindaian penuh."
+            runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+        }
+    }
+
     private fun handleContinuousPanelScanResult(
         panelOcrResult: OcrResult,
         parsed: OrderParseResult,
         fullBitmap: Bitmap,
-        captureModifiedAt: Long
+        captureModifiedAt: Long,
+        expandedScan: Boolean = false
     ) {
         if (!parsed.headerFound || parsed.items.isEmpty()) {
             if (!fullBitmap.isRecycled) fullBitmap.recycle()
             continuousScanInFlight = false
             isOcrRunning = false
             scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
+        // A compact 0.3.9-sized crop keeps ordinary 1–3 item orders fast.
+        // If at least four rows are visible (or three rows reach the crop edge),
+        // expand only this customer's scan so long orders are not truncated.
+        if (!expandedScan && shouldExpandPanelScan(panelOcrResult, parsed)) {
+            runExpandedPanelScan(fullBitmap, captureModifiedAt)
             return
         }
 
@@ -1026,8 +1151,9 @@ class MainActivity : Activity() {
             candidateStableFrameCount = 1
         }
 
-        val completeLargeOrder =
-            parsed.items.size >= 5 &&
+        val completeExpandedOrder =
+            expandedScan &&
+                parsed.items.size >= 3 &&
                 parsed.items.all { item ->
                     item.currentQuantity != null &&
                         item.requiredQuantity != null &&
@@ -1036,7 +1162,7 @@ class MainActivity : Activity() {
 
         if (
             candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT &&
-            !completeLargeOrder
+            !completeExpandedOrder
         ) {
             if (!fullBitmap.isRecycled) fullBitmap.recycle()
             continuousScanInFlight = false
@@ -2366,12 +2492,12 @@ class MainActivity : Activity() {
             return
         }
 
-        // Read up to 520px below the PESANAN header so longer customer
-        // orders (more than four item rows) remain inside the OCR crop.
+        // Fast default crop restored from 0.3.9.
+        // Orders with 4+ rows are expanded on demand in the panel scan handler.
         val left = (header.left - 300).coerceAtLeast(0)
         val top = (header.top - 24).coerceAtLeast(0)
         val right = (header.right + 300).coerceAtMost(imageWidth)
-        val bottom = (header.bottom + 560).coerceAtMost(imageHeight)
+        val bottom = (header.bottom + 290).coerceAtMost(imageHeight)
 
         verificationRegion = if (right > left && bottom > top) {
             Rect(left, top, right, bottom)
