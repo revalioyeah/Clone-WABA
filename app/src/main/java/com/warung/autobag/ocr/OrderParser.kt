@@ -1,6 +1,8 @@
 package com.warung.autobag.ocr
 
 import kotlin.math.abs
+import com.warung.autobag.detection.CatalogEntry
+import com.warung.autobag.detection.ItemCatalog
 
 /**
  * Satu item pesanan yang berhasil dipisahkan.
@@ -107,84 +109,64 @@ object OrderParser {
         val cost: Float
     )
 
-    private data class CatalogName(
-        val canonicalName: String,
-        val aliases: List<String>
-    )
-
     private data class CompiledCatalogAlias(
         val canonicalName: String,
         val pattern: Regex,
         val aliasLength: Int
     )
 
-    /**
-     * Katalog parser diselaraskan dengan ItemCatalog.
-     * Alias diperlukan karena OCR dapat membaca nama paket data sebagai
-     * "5 GB", "5GB", atau nama lengkap "Paket Data 5 GB".
-     */
-    private val catalogItems = listOf(
-        CatalogName("Minuman energi", listOf("Minuman energi", "Minumanenergi")),
-        CatalogName("Makanan kucing", listOf("Makanan kucing")),
-        CatalogName("Air mineral", listOf("Air mineral", "Airmineral")),
-        CatalogName("Paket Data 10 GB", listOf("Paket Data 10 GB", "Paket Data 10GB", "10 GB", "10GB")),
-        CatalogName("Paket Data 5 GB", listOf("Paket Data 5 GB", "Paket Data 5GB", "5 GB", "5GB")),
-        CatalogName("Paket Data 2 GB", listOf("Paket Data 2 GB", "Paket Data 2GB", "2 GB", "2GB")),
-        CatalogName("Kopi sachet", listOf("Kopi sachet", "Kopi saset")),
-        CatalogName("Mie goreng", listOf("Mie goreng")),
-        CatalogName("Mie rebus", listOf("Mie rebus")),
-        CatalogName("Buku tulis", listOf("Buku tulis")),
-        CatalogName("Rengginang", listOf("Rengginang")),
-        CatalogName("Teh celup", listOf("Teh celup", "Tehcelup")),
-        CatalogName("Minyak goreng", listOf("Minyak goreng", "Minyakgoreng")),
-        CatalogName("Sabun mandi", listOf("Sabun mandi", "Sabunmandi")),
-        CatalogName("Deterjen", listOf("Deterjen", "Detergen")),
-        CatalogName("Tisu", listOf("Tisu", "Tissue", "Tisu wajah")),
-        CatalogName("Teh botol", listOf("Teh botol", "Tehbotol")),
-        CatalogName("Kopi susu", listOf("Kopi susu", "Kopisusu")),
-        CatalogName("Biskuit", listOf("Biskuit")),
-        CatalogName("Sayuran", listOf("Sayuran")),
-        CatalogName("Kerupuk", listOf("Kerupuk")),
-        CatalogName("LPG 3 kg", listOf("LPG 3 kg", "LPG 3kg")),
-        CatalogName("Roti", listOf("Roti")),
-        CatalogName("Beras", listOf("Beras")),
-        CatalogName("Galon", listOf("Galon")),
-        CatalogName("Telur", listOf("Telur")),
-        CatalogName("Permen", listOf("Permen")),
-        CatalogName("Obat", listOf("Obat")),
-        CatalogName("Ciki", listOf("Ciki")),
-        CatalogName("Jamu", listOf("Jamu")),
-        CatalogName("Gula", listOf("Gula")),
-        CatalogName("Soda", listOf("Soda")),
-        CatalogName("E-Wallet", listOf("E-Wallet", "E Wallet", "Ewallet"))
-    ).distinctBy { it.canonicalName }
-        .sortedByDescending { entry ->
-            entry.aliases.maxOf { normalize(it).length }
-        }
+    @Volatile
+    private var cachedCatalogSnapshot: List<CatalogEntry> = emptyList()
 
-    // Compile catalog aliases once instead of rebuilding regex for every OCR line.
-    private val compiledCatalogAliases: List<CompiledCatalogAlias> =
-        catalogItems.flatMap { entry ->
-            entry.aliases.map { alias ->
-                val flexiblePattern = alias
-                    .trim()
-                    .split(Regex("""\s+"""))
-                    .joinToString("""\s+""") { Regex.escape(it) }
+    @Volatile
+    private var cachedCompiledCatalogAliases: List<CompiledCatalogAlias> =
+        compileCatalogAliases(ItemCatalog.entries)
 
-                CompiledCatalogAlias(
-                    canonicalName = entry.canonicalName,
-                    pattern = Regex(
-                        """(?i)(?<![A-Z0-9])$flexiblePattern(?![A-Z0-9])"""
-                    ),
-                    aliasLength = normalize(alias).length
-                )
+    private fun aliasesFor(catalogEntries: List<CatalogEntry>): List<CompiledCatalogAlias> {
+        val snapshot = catalogEntries.toList()
+        if (snapshot == cachedCatalogSnapshot) return cachedCompiledCatalogAliases
+
+        synchronized(this) {
+            if (snapshot != cachedCatalogSnapshot) {
+                cachedCompiledCatalogAliases = compileCatalogAliases(snapshot)
+                cachedCatalogSnapshot = snapshot
             }
-        }.sortedByDescending { it.aliasLength }
+            return cachedCompiledCatalogAliases
+        }
+    }
+
+    private fun compileCatalogAliases(
+        catalogEntries: List<CatalogEntry>
+    ): List<CompiledCatalogAlias> = catalogEntries
+        .flatMap { entry ->
+            (listOf(entry.name) + entry.aliases)
+                .distinctBy(::normalize)
+                .filter { it.isNotBlank() }
+                .map { alias ->
+                    val flexiblePattern = alias
+                        .trim()
+                        .split(Regex("""\s+"""))
+                        .joinToString("""\s+""") { Regex.escape(it) }
+
+                    CompiledCatalogAlias(
+                        canonicalName = entry.name,
+                        pattern = Regex(
+                            """(?i)(?<![A-Z0-9])$flexiblePattern(?![A-Z0-9])"""
+                        ),
+                        aliasLength = normalize(alias).length
+                    )
+                }
+        }
+        .sortedByDescending { it.aliasLength }
 
     /**
      * Fungsi utama parsing papan pesanan.
      */
-    fun parse(result: OcrResult): OrderParseResult {
+    fun parse(
+        result: OcrResult,
+        catalogEntries: List<CatalogEntry> = ItemCatalog.entries
+    ): OrderParseResult {
+        val compiledAliases = aliasesFor(catalogEntries)
 
         // 1. Cari header PESANAN.
         val header = result.lines.firstOrNull { line ->
@@ -235,7 +217,7 @@ object OrderParser {
             if (content.text.isBlank()) continue
 
             // Cari nama barang pada teks gabungan elemen.
-            val itemMatches = findCatalogMatches(content.text)
+            val itemMatches = findCatalogMatches(content.text, compiledAliases)
 
             for (match in itemMatches) {
 
@@ -498,11 +480,14 @@ object OrderParser {
      * Nama barang yang dihasilkan:
      * "Makanan kucing"
      */
-    private fun findCatalogMatches(text: String): List<TextMatch> {
+    private fun findCatalogMatches(
+        text: String,
+        compiledAliases: List<CompiledCatalogAlias>
+    ): List<TextMatch> {
 
         val found = mutableListOf<TextMatch>()
 
-        for (alias in compiledCatalogAliases) {
+        for (alias in compiledAliases) {
             for (match in alias.pattern.findAll(text)) {
 
                 val candidate = TextMatch(
