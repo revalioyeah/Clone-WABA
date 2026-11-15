@@ -47,7 +47,7 @@ class MainActivity : Activity() {
     companion object {
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REFERENCE_IMAGE_WIDTH = 2304f
-        private const val MAX_VERIFICATION_ATTEMPTS = 3
+        private const val MAX_VERIFICATION_ATTEMPTS = 5
         private const val MAX_CAPTURE_WAIT_MS = 900L
         private const val FRAME_POLL_INTERVAL_MS = 25L
         private const val COMPLETED_IDENTITY_SCAN_INTERVAL_MS = 300L
@@ -55,9 +55,9 @@ class MainActivity : Activity() {
         private const val GAME_SWITCH_DELAY_MS = 1_500L
         private const val CONTINUOUS_MONITOR_INTERVAL_MS = 90L
         private const val CONTINUOUS_IDLE_RETRY_MS = 100L
-        private const val CONTINUOUS_STABLE_FRAME_COUNT = 1
-        private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 4
-        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 100L
+        private const val CONTINUOUS_STABLE_FRAME_COUNT = 2
+        private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 8
+        private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 120L
         private const val PRODUCT_LOCATION_CACHE_TTL_MS = 10 * 60 * 1000L
     }
 
@@ -414,7 +414,13 @@ class MainActivity : Activity() {
                             scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
                         }
                     } else if (snapshot.state == OrderExecutionManager.State.PAUSED && continuousModeEnabled) {
-                        if (autoPausedAwaitingPanel) scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
+                        // Internal verification/dispatch pauses must not disable
+                        // customer monitoring. Explicit user PAUSE remains gated
+                        // by userPaused and is never auto-resumed.
+                        if (!userPaused) {
+                            autoPausedAwaitingPanel = true
+                            scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
+                        }
                     } else if (snapshot.state == OrderExecutionManager.State.FAILED && continuousModeEnabled) {
                         scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
                     }
@@ -772,26 +778,58 @@ class MainActivity : Activity() {
             autoPausedAwaitingPanel &&
             !userPaused
         ) {
-            if (signature == activeCustomerSignature) {
+            if (
+                signature != activeCustomerSignature &&
+                isPlausibleOrderChange(parsed)
+            ) {
+                // A stable, different order signature means the old customer
+                // has been replaced. Discard its checkpoint before starting
+                // the new customer's queue.
+                executionManager?.stop()
+                GestureAccessibilityService.instance?.cancelPendingTapBatch()
+                pendingVerification = null
+                autoPausedAwaitingPanel = false
+                activeCustomerSignature = null
+                activeCustomerLabel = null
+                lastServedCustomerSignature = null
+                executionStatusText.text =
+                    "Pesanan pelanggan berubah. Antrean lama dibatalkan dan pesanan baru disiapkan."
+            } else if (
+                signature == activeCustomerSignature &&
+                pendingVerificationHasProgress(parsed)
+            ) {
                 if (!fullBitmap.isRecycled) fullBitmap.recycle()
                 continuousScanInFlight = false
                 isOcrRunning = false
                 autoPausedAwaitingPanel = false
                 executionStatusText.text =
-                    "Panel pelanggan yang sama kembali terdeteksi. Melanjutkan verifikasi sebelumnya."
+                    "Jumlah pesanan sudah berubah sesuai hasil tap. Melanjutkan verifikasi tanpa mengirim tap ulang."
                 executionManager?.resume()
                 scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
                 return
+            } else {
+                // The panel still shows the old count. Do not resume the
+                // gesture queue. Periodically inspect the full screen so a
+                // different customer with an identical order can be detected
+                // from the customer label.
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastCompletedIdentityScanAt >= COMPLETED_IDENTITY_SCAN_INTERVAL_MS) {
+                    lastCompletedIdentityScanAt = now
+                    runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
+                } else {
+                    if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                    continuousScanInFlight = false
+                    isOcrRunning = false
+                    executionStatusText.text =
+                        if (signature != activeCustomerSignature) {
+                            "Panel berubah tetapi hasil OCR belum cukup lengkap untuk memastikan pesanan baru. Menunggu pembacaan berikutnya; tidak ada tap ulang."
+                        } else {
+                            "Menunggu perubahan jumlah atau pelanggan baru. Tidak ada tap ulang yang dikirim."
+                        }
+                    scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                }
+                return
             }
-
-            executionManager?.stop()
-            GestureAccessibilityService.instance?.cancelPendingTapBatch()
-            pendingVerification = null
-            autoPausedAwaitingPanel = false
-            activeCustomerSignature = null
-            activeCustomerLabel = null
-            executionStatusText.text =
-                "Pesanan berbeda terdeteksi setelah interupsi. Menyiapkan pembacaan lengkap untuk antrean baru."
         } else if (
             managerState == OrderExecutionManager.State.PAUSED ||
             managerState == OrderExecutionManager.State.RUNNING ||
@@ -969,32 +1007,60 @@ class MainActivity : Activity() {
         val managerState = executionManager?.state
 
         val detectedCustomerLabel = extractCustomerLabel(result)
+        if (
+            activeCustomerLabel == null &&
+            detectedCustomerLabel != null &&
+            signature == activeCustomerSignature
+        ) {
+            // Panel-only OCR is the fast path for later customers. The first
+            // full-screen identity scan establishes a baseline label so an
+            // identical order from a different customer can be distinguished.
+            activeCustomerLabel = detectedCustomerLabel
+        }
         val customerIdentityChanged =
             activeCustomerLabel != null &&
                 detectedCustomerLabel != null &&
                 !activeCustomerLabel.equals(detectedCustomerLabel, ignoreCase = true)
 
         if (managerState == OrderExecutionManager.State.PAUSED && autoPausedAwaitingPanel && !userPaused) {
-            if (signature == activeCustomerSignature && !customerIdentityChanged) {
+            if (
+                customerIdentityChanged ||
+                (
+                    signature != activeCustomerSignature &&
+                    isPlausibleOrderChange(parsed)
+                )
+            ) {
+                // A different order or customer label confirms that the
+                // previous verification checkpoint belongs to an old customer.
+                executionManager?.stop()
+                GestureAccessibilityService.instance?.cancelPendingTapBatch()
+                pendingVerification = null
+                autoPausedAwaitingPanel = false
+                activeCustomerSignature = null
+                activeCustomerLabel = null
+                lastServedCustomerSignature = null
+                executionStatusText.text =
+                    "Pelanggan baru terdeteksi. Antrean lama dibatalkan dan pesanan baru disiapkan."
+            } else if (
+                signature == activeCustomerSignature &&
+                pendingVerificationHasProgress(parsed)
+            ) {
                 autoPausedAwaitingPanel = false
                 executionStatusText.text =
-                    "Panel pelanggan yang sama kembali terdeteksi. Melanjutkan verifikasi sebelumnya."
+                    "Jumlah pesanan sudah berubah sesuai hasil tap. Melanjutkan verifikasi tanpa tap ulang."
                 executionManager?.resume()
                 scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
                 return
+            } else {
+                executionStatusText.text =
+                    if (signature != activeCustomerSignature) {
+                        "Perubahan panel belum cukup lengkap untuk memastikan pelanggan baru. Menunggu frame berikutnya; tidak ada tap ulang."
+                    } else {
+                        "Panel masih menunjukkan jumlah sebelum tap. Menunggu frame berikutnya atau identitas pelanggan baru; tidak ada tap ulang."
+                    }
+                scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                return
             }
-
-            // A different order signature or customer label means the old
-            // customer has left. Discard its stale checkpoint before starting
-            // the new customer's queue.
-            executionManager?.stop()
-            GestureAccessibilityService.instance?.cancelPendingTapBatch()
-            pendingVerification = null
-            autoPausedAwaitingPanel = false
-            activeCustomerSignature = null
-            activeCustomerLabel = null
-            executionStatusText.text =
-                "Pelanggan baru terdeteksi. Antrean lama ditutup dan pesanan baru sedang disiapkan."
         } else if (
             managerState == OrderExecutionManager.State.PAUSED ||
             managerState == OrderExecutionManager.State.RUNNING ||
@@ -1053,9 +1119,8 @@ class MainActivity : Activity() {
 
         if (pendingOrders.isEmpty()) {
             activeCustomerSignature = signature
-            if (useCustomerLabelFromResult) {
-                activeCustomerLabel = extractCustomerLabel(result)
-            }
+            activeCustomerLabel =
+                if (useCustomerLabelFromResult) extractCustomerLabel(result) else null
             lastServedCustomerSignature = signature
             latestParsedOrder = parsed
             latestCaptureModifiedAtOcr = captureModifiedAt
@@ -1087,9 +1152,8 @@ class MainActivity : Activity() {
         }
         if (tasks.isEmpty()) {
             activeCustomerSignature = signature
-            if (useCustomerLabelFromResult) {
-                activeCustomerLabel = extractCustomerLabel(result)
-            }
+            activeCustomerLabel =
+                if (useCustomerLabelFromResult) extractCustomerLabel(result) else null
             lastServedCustomerSignature = signature
             scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
             return
@@ -1101,9 +1165,8 @@ class MainActivity : Activity() {
         latestImageHeight = imageHeight
         latestCaptureModifiedAtOcr = captureModifiedAt
         activeCustomerSignature = signature
-        if (useCustomerLabelFromResult) {
-            activeCustomerLabel = extractCustomerLabel(result)
-        }
+        activeCustomerLabel =
+            if (useCustomerLabelFromResult) extractCustomerLabel(result) else null
         lastServedCustomerSignature = null
         lastCompletedIdentityScanAt = 0L
         autoPausedAwaitingPanel = false
@@ -1225,9 +1288,46 @@ class MainActivity : Activity() {
     }
 
     private fun createCustomerSignature(parsed: OrderParseResult): String =
-        parsed.items.joinToString("|") { item ->
-            "${normalizeItemName(item.name)}:${item.requiredQuantity ?: -1}"
+        parsed.items
+            .map { item ->
+                "${normalizeItemName(item.name)}:${item.requiredQuantity ?: -1}"
+            }
+            .sorted()
+            .joinToString("|")
+
+    /**
+     * Rejects likely partial OCR as a customer change. A changed signature is
+     * considered plausible when the parsed panel is complete and either all
+     * names are new, the item set is at least as large as the active order, or
+     * the same names now have different required quantities.
+     */
+    private fun isPlausibleOrderChange(parsed: OrderParseResult): Boolean {
+        val activeSignature = activeCustomerSignature ?: return true
+        if (!parsed.headerFound || parsed.items.isEmpty()) return false
+        if (parsed.items.any {
+                it.currentQuantity == null ||
+                    it.requiredQuantity == null ||
+                    it.requiredQuantity <= 0
+            }
+        ) {
+            return false
         }
+
+        val activeItems = activeSignature.split("|")
+            .filter { it.isNotBlank() }
+        val activeNames = activeItems.map { it.substringBefore(":") }.toSet()
+        val newNames = parsed.items.map { normalizeItemName(it.name) }.toSet()
+        if (newNames.isEmpty()) return false
+
+        val overlap = activeNames.intersect(newNames)
+        if (overlap.isEmpty()) return true
+
+        if (newNames == activeNames) {
+            return createCustomerSignature(parsed) != activeSignature
+        }
+
+        return newNames.size >= activeNames.size
+    }
 
     private fun extractCustomerLabel(result: OcrResult): String? {
         val ignored = setOf("pesanan", "reputasiwarung", "levelwarung")
@@ -1777,6 +1877,23 @@ class MainActivity : Activity() {
             return
         }
 
+        // A different, readable order signature is treated as a possible
+        // customer/order change, not as a failed tap. Pause the old checkpoint
+        // and let the continuous monitor confirm the new panel on fresh frames.
+        val observedSignature = createCustomerSignature(parsed)
+        if (
+            continuousModeEnabled &&
+            activeCustomerSignature != null &&
+            observedSignature.isNotBlank() &&
+            observedSignature != activeCustomerSignature &&
+            isPlausibleOrderChange(parsed)
+        ) {
+            pauseForContinuousRecovery(
+                "Daftar pesanan berubah saat verifikasi. Menahan antrean lama dan memastikan pesanan pelanggan berikutnya."
+            )
+            return
+        }
+
         val observed = mutableListOf<OrderExecutionManager.ObservedQuantity>()
         val missingNames = mutableListOf<String>()
         val unchangedNames = mutableListOf<String>()
@@ -1807,8 +1924,12 @@ class MainActivity : Activity() {
         }
 
         if (invalidReasons.isNotEmpty()) {
-            pendingVerification = null
-            executionManager?.verificationFailed(invalidReasons.joinToString("; "))
+            if (continuousModeEnabled) {
+                pauseForContinuousRecovery(invalidReasons.joinToString("; "))
+            } else {
+                pendingVerification = null
+                executionManager?.verificationFailed(invalidReasons.joinToString("; "))
+            }
             return
         }
 
@@ -1831,19 +1952,67 @@ class MainActivity : Activity() {
             if (pending.attempts < MAX_VERIFICATION_ATTEMPTS - 1) {
                 pending.attempts++
                 executionStatusText.text =
-                    "Jumlah ${unchangedNames.joinToString()} belum berubah pada OCR (${pending.attempts + 1}/$MAX_VERIFICATION_ATTEMPTS). Memeriksa frame berikutnya."
+                    "Jumlah ${unchangedNames.joinToString()} belum berubah pada OCR (${pending.attempts + 1}/$MAX_VERIFICATION_ATTEMPTS). Menunggu frame game berikutnya."
                 scheduleVerificationPoll(verificationRetryDelay(pending.attempts))
             } else {
-                pendingVerification = null
-                executionManager?.verificationFailed(
-                    "Jumlah ${unchangedNames.joinToString()} tidak berubah setelah $MAX_VERIFICATION_ATTEMPTS pemeriksaan. Tidak ada tap ulang otomatis."
-                )
+                val reason =
+                    "Jumlah ${unchangedNames.joinToString()} belum berubah setelah $MAX_VERIFICATION_ATTEMPTS pemeriksaan. Tidak ada tap ulang otomatis."
+                if (continuousModeEnabled) {
+                    pauseForContinuousRecovery(reason)
+                } else {
+                    pendingVerification = null
+                    executionManager?.verificationFailed(reason)
+                }
             }
             return
         }
 
         pendingVerification = null
         executionManager?.confirmBatchQuantities(observed)
+    }
+
+    /**
+     * Returns true only when every item in the pending tap group has advanced
+     * by at least one unit and remains within the number of taps actually sent.
+     * This lets continuous mode recover from a delayed game update without
+     * replaying gestures.
+     */
+    private fun pendingVerificationHasProgress(parsed: OrderParseResult): Boolean {
+        val pending = pendingVerification ?: return false
+        if (pending.items.isEmpty()) return false
+
+        return pending.items.all { target ->
+            val item = parsed.items.firstOrNull {
+                normalizeItemName(it.name) == normalizeItemName(target.itemName)
+            } ?: return@all false
+
+            val current = item.currentQuantity ?: return@all false
+            val required = item.requiredQuantity ?: return@all false
+
+            required == target.requiredQuantity &&
+                current in (target.previousQuantity + 1)..target.expectedQuantity
+        }
+    }
+
+    /**
+     * A recoverable verification mismatch pauses the old gesture checkpoint,
+     * but keeps continuous monitoring alive so the app can notice delayed
+     * quantity updates or a replacement customer.
+     */
+    private fun pauseForContinuousRecovery(reason: String) {
+        if (!continuousModeEnabled) {
+            pendingVerification = null
+            executionManager?.verificationFailed(reason)
+            return
+        }
+
+        autoPausedAwaitingPanel = true
+        executionManager?.verificationFailed(
+            "$reason Antrean lama dijeda sementara; tidak ada tap ulang otomatis."
+        )
+        executionStatusText.text =
+            "$reason Memantau perubahan panel atau pelanggan baru."
+        scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
     }
 
     private fun waitForContinuousPanel(
@@ -1871,14 +2040,15 @@ class MainActivity : Activity() {
             "$reason Antrean dijeda sementara tanpa mengirim ulang gesture."
         )
         executionStatusText.text =
-            "$reason Menunggu panel kembali atau pelanggan baru terdeteksi."
+            "$reason Menunggu panel kembali, progres jumlah, atau pelanggan baru. Tidak ada tap ulang otomatis."
         scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
     }
 
     private fun verificationRetryDelay(retryNumber: Int): Long = when (retryNumber) {
-        1 -> 80L
-        2 -> 120L
-        else -> 120L
+        1 -> 120L
+        2 -> 180L
+        3 -> 250L
+        else -> 350L
     }
 
     private fun retryOrFailVerification(reason: String) {
