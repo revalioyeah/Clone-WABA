@@ -82,7 +82,8 @@ object SmartItemDetector {
         ocrResult: OcrResult,
         orders: List<ParsedOrderItem>,
         imageWidth: Int,
-        imageHeight: Int
+        imageHeight: Int,
+        catalogEntries: List<CatalogEntry> = ItemCatalog.entries
     ): SmartDetectionResult {
 
         if (imageWidth <= 0 || imageHeight <= 0) {
@@ -107,7 +108,7 @@ object SmartItemDetector {
 
         for (order in orders) {
 
-            val catalogEntry = ItemCatalog.find(order.name)
+            val catalogEntry = ItemCatalog.find(order.name, catalogEntries)
 
             if (catalogEntry == null) {
                 notFound.add(order.name)
