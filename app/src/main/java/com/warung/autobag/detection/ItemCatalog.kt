@@ -28,10 +28,13 @@ enum class ShelfRegion(
     ),
 
     PULSE_COUNTER(
-        minXRatio = 0.04f,
-        maxXRatio = 0.40f,
-        minYRatio = 0.82f,
-        maxYRatio = 0.99f
+        // Panel Konter Pulsa berada di bawah kiri. Batas dibuat sedikit
+        // lebih longgar agar tetap terbaca pada variasi aspect ratio,
+        // letterboxing, dan bounding box OCR yang bergeser.
+        minXRatio = 0.02f,
+        maxXRatio = 0.48f,
+        minYRatio = 0.70f,
+        maxYRatio = 1.00f
     )
 }
 
@@ -265,6 +268,12 @@ object ItemCatalog {
             aliases = listOf(
                 "2GB",
                 "2 GB",
+                "2-G-B",
+                "2 G B",
+                "2G8",
+                "2 G8",
+                "2 6B",
+                "2 68",
                 "Paket Data 2GB",
                 "Paket Data 2 GB"
             ),
@@ -276,6 +285,12 @@ object ItemCatalog {
             aliases = listOf(
                 "5GB",
                 "5 GB",
+                "5-G-B",
+                "5 G B",
+                "5G8",
+                "5 G8",
+                "5 6B",
+                "5 68",
                 "Paket Data 5GB",
                 "Paket Data 5 GB"
             ),
@@ -287,6 +302,12 @@ object ItemCatalog {
             aliases = listOf(
                 "10GB",
                 "10 GB",
+                "10-G-B",
+                "10 G B",
+                "10G8",
+                "10 G8",
+                "10 6B",
+                "10 68",
                 "Paket Data 10GB",
                 "Paket Data 10 GB"
             ),
