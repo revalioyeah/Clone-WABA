@@ -125,6 +125,10 @@ class MainActivity : Activity() {
     private var cachedLocationImageHeight = 0
     private var cachedLocationUpdatedAt = 0L
     private var userPaused = false
+    private var debtTapAttempted = false
+    private var debtDialogClearFrames = 0
+    private var lastDebtDialogFrame = 0L
+    private val debtRequestTitle = Regex("""\bminta\s+(?:ngutang|utang|hutang)$""", RegexOption.IGNORE_CASE)
 
     private data class PendingVerificationItem(
         val itemName: String,
@@ -312,7 +316,7 @@ class MainActivity : Activity() {
         }
 
         val automationNote = TextView(this).apply {
-            text = "Mode berkelanjutan memantau pelanggan baru secara otomatis. Capture harus tetap aktif. Periksa titik hijau di tengah setiap produk sebelum mulai. Jika muncul interupsi, aplikasi menunggu panel kembali dan tidak mengulang tap secara buta."
+            text = "Mode berkelanjutan memantau pelanggan baru secara otomatis. Capture harus tetap aktif. Periksa titik hijau di tengah setiap produk sebelum mulai. Permintaan utang yang dikenali diterima otomatis. Jika dialog lain menghalangi pesanan, aplikasi menunggu panel kembali."
             textSize = 12f
             setTextColor(Color.DKGRAY)
         }
@@ -374,7 +378,7 @@ class MainActivity : Activity() {
                 - Titik hijau di tengah produk harus diperiksa sebelum mode otomatis dijalankan.
                 - Hingga ${TargetGameConfig.MAX_ITEM_TYPES_PER_SEQUENCE} jenis barang diproses berurutan sebelum satu verifikasi OCR panel.
                 - Jika jumlah salah satu barang tidak cocok, antrean dijeda dan tidak mengulang tap secara otomatis.
-                - Jika interupsi muncul saat urutan tap berjalan, tekan PAUSE; selesaikan interupsi di game, lalu LANJUTKAN untuk verifikasi ulang.
+                - Permintaan utang yang dikenali akan ditangani dengan tombol Kasih utang. Interupsi lain bisa diselesaikan manual di game.
                 - Tombol STOP mengakhiri seluruh sesi otomatis.
             """.trimIndent()
             textSize = 13f
@@ -819,7 +823,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Mulai mode otomatis berkelanjutan")
             .setMessage(
-                "Aplikasi akan memantau panel PESANAN, membaca pelanggan baru, mendeteksi lokasi barang, lalu menyelesaikan pesanan satu per satu. Setelah menekan MULAI, pindah ke game dalam 1,5 detik. Mode tetap aktif sampai kamu menekan STOP.\n\nPastikan BACA PESANAN & DETEKSI LOKASI sudah dijalankan agar cache lokasi seluruh rak tersedia. Periksa titik hijau pada preview; titik kantong tidak diperlukan."
+                "Aplikasi akan memantau panel PESANAN, membaca pelanggan baru, mendeteksi lokasi barang, lalu menyelesaikan pesanan satu per satu. Setelah menekan MULAI, pindah ke game dalam 1,5 detik. Permintaan utang yang dikenali akan diterima otomatis. Mode tetap aktif sampai kamu menekan STOP.\n\nPastikan BACA PESANAN & DETEKSI LOKASI sudah dijalankan agar cache lokasi seluruh rak tersedia. Periksa titik hijau pada preview; titik kantong tidak diperlukan."
             )
             .setNegativeButton("BATAL", null)
             .setPositiveButton("MULAI") { _, _ ->
@@ -917,7 +921,7 @@ class MainActivity : Activity() {
 
         val imageWidth = fullBitmap.width
         val imageHeight = fullBitmap.height
-        val panelRect = verificationRegion?.let { Rect(it) }?.apply {
+        val panelRect = verificationRegion?.takeUnless { debtTapAttempted }?.let { Rect(it) }?.apply {
             intersect(0, 0, imageWidth, imageHeight)
         }
 
@@ -969,7 +973,9 @@ class MainActivity : Activity() {
                         }
 
                         if (usingPanelCrop) {
-                            if (!parsed.headerFound || parsed.items.isEmpty()) {
+                            if (hasDebtRequestTitle(result)) {
+                                runContinuousFullScreenScan(fullBitmap, modifiedAt)
+                            } else if (!parsed.headerFound || parsed.items.isEmpty()) {
                                 // The cached panel position may be stale after a
                                 // layout/orientation change. Recheck the full frame
                                 // every third miss instead of OCR-scanning the
@@ -1000,6 +1006,10 @@ class MainActivity : Activity() {
                             if (!fullBitmap.isRecycled) fullBitmap.recycle()
                             continuousScanInFlight = false
                             isOcrRunning = false
+                            if (handleDebtRequest(result, imageWidth, imageHeight, modifiedAt)) {
+                                scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
+                                return@runOnUiThread
+                            }
                             updateVerificationRegion(result, imageWidth, imageHeight)
                             handleContinuousScanResult(
                                 result = result,
@@ -1135,6 +1145,11 @@ class MainActivity : Activity() {
                             if (!fullBitmap.isRecycled) fullBitmap.recycle()
                             continuousScanInFlight = false
                             isOcrRunning = false
+                            return@runOnUiThread
+                        }
+
+                        if (hasDebtRequestTitle(expandedResult)) {
+                            runContinuousFullScreenScan(fullBitmap, captureModifiedAt)
                             return@runOnUiThread
                         }
 
@@ -1401,6 +1416,10 @@ class MainActivity : Activity() {
                     isOcrRunning = false
                     if (!continuousModeEnabled || isFinishing || isDestroyed) return@recognize
 
+                    if (handleDebtRequest(result, imageWidth, imageHeight, captureModifiedAt)) {
+                        scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
+                        return@recognize
+                    }
                     val parsed = OrderParser.parse(result, currentCatalogEntries())
                     updateVerificationRegion(result, imageWidth, imageHeight)
                     rememberProductLocationCache(result, imageWidth, imageHeight)
@@ -1431,6 +1450,94 @@ class MainActivity : Activity() {
                 "Pembacaan lengkap panel/rak gagal: ${exception.message ?: "tidak diketahui"}."
             scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
         }
+    }
+
+    private fun hasDebtRequestTitle(result: OcrResult): Boolean =
+        result.lines.any { debtRequestTitle.containsMatchIn(it.text.trim()) }
+
+    /**
+     * Consume recognized dialog frames before normal order processing.
+     * A tap is attempted only once until two full frames show no dialog.
+     */
+    private fun handleDebtRequest(
+        result: OcrResult,
+        width: Int,
+        height: Int,
+        captureModifiedAt: Long
+    ): Boolean {
+        if (!continuousModeEnabled || userPaused || !ScreenCaptureService.isRunning) return false
+
+        val title = result.lines.firstOrNull { debtRequestTitle.containsMatchIn(it.text.trim()) }
+        val accept = findDebtButton(result, "kasihutang", 2)
+
+        if (title == null) {
+            if (!debtTapAttempted) return false
+            if (accept != null) {
+                debtDialogClearFrames = 0
+                return true
+            }
+            if (captureModifiedAt <= lastDebtDialogFrame) return true
+            lastDebtDialogFrame = captureModifiedAt
+            debtDialogClearFrames++
+            if (debtDialogClearFrames < CONTINUOUS_STABLE_FRAME_COUNT) return true
+            debtTapAttempted = false
+            debtDialogClearFrames = 0
+            return false
+        }
+
+        debtDialogClearFrames = 0
+        if (debtTapAttempted) return true
+
+        val reject = findDebtButton(result, "tolak", 1)
+        if (accept == null || reject == null ||
+            accept.left <= reject.right || minOf(accept.top, reject.top) <= title.bottom ||
+            maxOf(accept.top, reject.top) >= minOf(accept.bottom, reject.bottom)
+        ) {
+            executionStatusText.text = "Permintaan utang terdeteksi. Menunggu posisi tombol terbaca."
+            return true
+        }
+
+        val accessibility = GestureAccessibilityService.instance
+        if (accessibility?.isTargetGameForeground() != true) return true
+
+        debtTapAttempted = true
+        lastDebtDialogFrame = captureModifiedAt
+        val accepted = GestureController.executeTapFromImage(
+            sourceImagePoint = GestureController.ScreenPoint(
+                x = (accept.left + accept.right) / 2f,
+                y = (accept.top + accept.bottom) / 2f
+            ),
+            imageWidth = width,
+            imageHeight = height,
+            onComplete = { _, _ -> }
+        )
+        executionStatusText.text = if (accepted) {
+            "Kasih utang diketuk. Menunggu dialog tertutup."
+        } else {
+            "Tap Kasih utang gagal dikirim. Selesaikan dialog di game."
+        }
+        return true
+    }
+
+    private fun findDebtButton(result: OcrResult, label: String, wordCount: Int): Rect? {
+        for (line in result.lines) {
+            if (normalizeItemName(line.text) == label) {
+                return Rect(line.left, line.top, line.right, line.bottom)
+            }
+            // OCR may group both buttons in one line. Use the bounds of
+            // the matching words so the tap still lands on the right button.
+            val words = line.elements.sortedBy { it.left }
+            val match = words.windowed(wordCount).firstOrNull { elements ->
+                elements.joinToString("") { normalizeItemName(it.text) } == label
+            } ?: continue
+            return Rect(
+                match.minOf { it.left },
+                match.minOf { it.top },
+                match.maxOf { it.right },
+                match.maxOf { it.bottom }
+            )
+        }
+        return null
     }
 
     private fun handleContinuousScanResult(
@@ -1837,6 +1944,9 @@ class MainActivity : Activity() {
 
     private fun stopContinuousMode() {
         continuousModeEnabled = false
+        debtTapAttempted = false
+        debtDialogClearFrames = 0
+        lastDebtDialogFrame = 0L
         userPaused = false
         autoPausedAwaitingPanel = false
         activeCustomerSignature = null
@@ -2214,7 +2324,7 @@ class MainActivity : Activity() {
 
         val fullWidth = fullBitmap.width
         val fullHeight = fullBitmap.height
-        val cropRect = verificationRegion?.let { Rect(it) }?.apply {
+        val cropRect = verificationRegion?.takeUnless { debtTapAttempted }?.let { Rect(it) }?.apply {
             intersect(0, 0, fullWidth, fullHeight)
         }
 
@@ -2258,7 +2368,8 @@ class MainActivity : Activity() {
                         }
                     }
                     val cropNeedsFallback = useCrop && (
-                        !parsed.headerFound || parsed.items.isEmpty() || missingTargets.isNotEmpty()
+                        !parsed.headerFound || parsed.items.isEmpty() || missingTargets.isNotEmpty() ||
+                            (continuousModeEnabled && hasDebtRequestTitle(result))
                     )
 
                     if (cropNeedsFallback) {
@@ -2271,6 +2382,10 @@ class MainActivity : Activity() {
                     if (pendingVerification !== pending) return@recognize
 
                     if (!useCrop) {
+                        if (handleDebtRequest(result, fullWidth, fullHeight, pending.lastCaptureModified)) {
+                            scheduleVerificationPoll(CONTINUOUS_PANEL_RETRY_DELAY_MS)
+                            return@recognize
+                        }
                         updateVerificationRegion(result, fullWidth, fullHeight)
                     }
                     processVerificationResult(pending, parsed)
@@ -2327,6 +2442,10 @@ class MainActivity : Activity() {
                     if (!bitmap.isRecycled) bitmap.recycle()
                     isVerificationOcrRunning = false
                     if (pendingVerification !== pending) return@recognize
+                    if (handleDebtRequest(result, width, height, pending.lastCaptureModified)) {
+                        scheduleVerificationPoll(CONTINUOUS_PANEL_RETRY_DELAY_MS)
+                        return@recognize
+                    }
                     updateVerificationRegion(result, width, height)
                     processVerificationResult(pending, OrderParser.parse(result, currentCatalogEntries()))
                 },
