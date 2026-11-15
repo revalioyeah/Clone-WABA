@@ -350,6 +350,7 @@ class ScreenCaptureService : Service() {
     private fun saveLatestFrame(reader: ImageReader) {
         val now = SystemClock.elapsedRealtime()
         val image = reader.acquireLatestImage() ?: return
+        val acquiredAtWall = System.currentTimeMillis()
 
         // Capture hanya menyimpan frame game. Pemeriksaan foreground dibatasi
         // maksimal dua kali per detik agar tidak membebani callback tiap frame.
@@ -418,6 +419,8 @@ class ScreenCaptureService : Service() {
                 output.flush()
             }
 
+            // Only the timing-sensitive NPC mode uses acquisition time, including JPEG latency.
+            if (fastMinigameCapture) temporaryFile.setLastModified(acquiredAtWall)
             // Atomic rename prevents OCR from opening a partially written JPEG.
             Os.rename(temporaryFile.absolutePath, outputFile.absolutePath)
             lastSavedAt = now
