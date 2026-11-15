@@ -40,6 +40,14 @@ object SmartItemDetector {
      * Offset target diskalakan mengikuti lebar gambar aktual.
      */
     private const val REFERENCE_IMAGE_WIDTH = 2304f
+    // Pada konter, tulisan di kartu dan label di bawahnya dapat
+    // menghasilkan alias yang sama. Keduanya mengarah ke baris kartu.
+    private const val PULSE_CARD_OFFSET_Y = 76f
+    private const val PULSE_LABEL_MIN_OFFSET_Y = 50f
+    private const val PULSE_LABEL_MAX_OFFSET_Y = 140f
+    private val dataPackageNames = setOf(
+        "Paket Data 2 GB", "Paket Data 5 GB", "Paket Data 10 GB"
+    )
 
     private data class TextSpan(
         val start: Int,
@@ -103,6 +111,12 @@ object SmartItemDetector {
         }
 
         val scale = imageWidth / REFERENCE_IMAGE_WIDTH
+        val pulseHeaderY = ocrResult.lines.firstOrNull { line ->
+            normalize(line.text) == "KONTERPULSA" &&
+                (line.left + line.right) / (2f * imageWidth) in
+                    ShelfRegion.PULSE_COUNTER.minXRatio..ShelfRegion.PULSE_COUNTER.maxXRatio &&
+                (line.top + line.bottom) / (2f * imageHeight) >= ShelfRegion.PULSE_COUNTER.minYRatio
+        }?.let { (it.top + it.bottom) / 2f }
         val detections = mutableListOf<SmartDetectedItem>()
         val notFound = mutableListOf<String>()
 
@@ -116,6 +130,9 @@ object SmartItemDetector {
             }
 
             val region = catalogEntry.shelfRegion
+            val isDataPackage = region == ShelfRegion.PULSE_COUNTER &&
+                catalogEntry.name in dataPackageNames
+            val packageHeaderY = pulseHeaderY.takeIf { isDataPackage }
 
             /*
              * Cari alias di dalam baris OCR. Baris boleh mengandung
@@ -207,6 +224,13 @@ object SmartItemDetector {
                         return@textLoop null
                     }
 
+                    if (packageHeaderY != null) {
+                        val distanceFromHeader = (matchedBox.centerY - packageHeaderY) / scale
+                        if (distanceFromHeader !in PULSE_LABEL_MIN_OFFSET_Y..PULSE_LABEL_MAX_OFFSET_Y) {
+                            return@textLoop null
+                        }
+                    }
+
                     LabelCandidate(
                         text = searchableText.substring(
                             match.start,
@@ -217,13 +241,11 @@ object SmartItemDetector {
                 }
             }
 
-            // Pilih bounding box label yang paling spesifik, bukan
-            // baris OCR terlebar yang kebetulan mengandung nama barang.
-            // Jika OCR menangkap dua teks untuk produk yang sama (umum
-            // pada paket data: tulisan di ikon dan label di bawah ikon),
-            // pilih label paling bawah karena itulah label nama produk.
+            // Label paket di bawah kartu lebih dekat ke pusat X kartu.
             val matched = candidates.maxWithOrNull(
                 compareBy<LabelCandidate> { candidate ->
+                    if (isDataPackage) candidate.box.centerY else 0f
+                }.thenBy { candidate ->
                     val width = candidate.box.right - candidate.box.left
                     val height = candidate.box.bottom - candidate.box.top
                     // A compact label is preferable to a wide OCR line
@@ -252,10 +274,8 @@ object SmartItemDetector {
                 (imageWidth - 1).toFloat()
             )
 
-            val targetY = (
-                labelCenterY -
-                    catalogEntry.targetOffsetYReferencePx * scale
-                ).coerceIn(
+            val targetY = (packageHeaderY?.plus(PULSE_CARD_OFFSET_Y * scale)
+                ?: (labelCenterY - catalogEntry.targetOffsetYReferencePx * scale)).coerceIn(
                     0f,
                     (imageHeight - 1).toFloat()
                 )
