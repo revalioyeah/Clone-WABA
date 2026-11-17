@@ -20,7 +20,10 @@ data class ParsedOrderItem(
 data class OrderParseResult(
     val items: List<ParsedOrderItem>,
     val headerFound: Boolean,
-    val message: String
+    val message: String,
+    // Quantity rows without a paired catalog label indicate that OCR may have
+    // missed an item name. Automation must not silently execute a partial order.
+    val unmatchedQuantityCount: Int = 0
 )
 
 /**
@@ -40,7 +43,7 @@ data class OrderParseResult(
 object OrderParser {
 
     private val quantityPattern = Regex(
-        """(?i)(?<!\d)([0-9o]{0,2})\s*[/|]\s*(\d{1,2})(?!\d)"""
+        """(?i)(?<!\d)([0-9oOlI]{0,2})\s*[/|!Il]\s*([0-9Il]{1,2})(?!\d)"""
     )
 
     // Padding mengikuti lebar tulisan PESANAN agar tetap proporsional
@@ -112,7 +115,8 @@ object OrderParser {
     private data class CompiledCatalogAlias(
         val canonicalName: String,
         val pattern: Regex,
-        val aliasLength: Int
+        val aliasLength: Int,
+        val normalizedAlias: String
     )
 
     private val aliasWhitespace = Regex("""\s+""")
@@ -156,7 +160,8 @@ object OrderParser {
                         pattern = Regex(
                             """(?i)(?<![A-Z0-9])$flexiblePattern(?![A-Z0-9])"""
                         ),
-                        aliasLength = normalize(alias).length
+                        aliasLength = normalize(alias).length,
+                        normalizedAlias = normalize(alias)
                     )
                 }
         }
@@ -242,10 +247,15 @@ object OrderParser {
                 // Jumlah berjalan juga dapat berupa 1, 2, dan seterusnya.
                 val currentText = match.groupValues[1]
                     .replace('o', '0', ignoreCase = true)
+                    .replace('i', '1', ignoreCase = true)
+                    .replace('l', '1', ignoreCase = true)
 
                 val current = currentText.toIntOrNull()
 
-                val required = match.groupValues[2].toIntOrNull()
+                val requiredText = match.groupValues[2]
+                    .replace('i', '1', ignoreCase = true)
+                    .replace('l', '1', ignoreCase = true)
+                val required = requiredText.toIntOrNull()
 
                 // Pembilang boleh tidak terbaca OCR.
                 // Penyebut tetap harus berhasil dikenali.
@@ -272,7 +282,8 @@ object OrderParser {
             return OrderParseResult(
                 items = emptyList(),
                 headerFound = true,
-                message = "Papan ditemukan, tetapi nama barang belum berhasil dikenali."
+                message = "Papan ditemukan, tetapi nama barang belum berhasil dikenali.",
+                unmatchedQuantityCount = rawQuantities.size
             )
         }
 
@@ -340,10 +351,14 @@ object OrderParser {
             }
 
         val ignoredUnpairedLabels = itemFragments.size - parsedItems.size
+        val matchedQuantityIndices = assignments.values.toSet()
+        val unmatchedQuantityCount =
+            (quantityFragments.size - matchedQuantityIndices.size).coerceAtLeast(0)
 
         return OrderParseResult(
             items = parsedItems,
             headerFound = true,
+            unmatchedQuantityCount = unmatchedQuantityCount,
             message = when {
                 parsedItems.isEmpty() ->
                     "Papan ditemukan, tetapi belum ada nama barang yang cocok dengan jumlah pesanan."
@@ -514,7 +529,114 @@ object OrderParser {
             }
         }
 
-        return found.sortedBy { it.start }
+        if (found.isNotEmpty()) {
+            return found.sortedBy { it.start }
+        }
+
+        // OCR can confuse one or two characters in longer product labels.
+        // Use a conservative fuzzy fallback only when no exact alias matched.
+        val fuzzy = findFuzzyCatalogMatch(text, compiledAliases)
+        return if (fuzzy != null) listOf(fuzzy) else emptyList()
+    }
+
+    private data class FuzzyCandidate(
+        val match: TextMatch,
+        val distance: Int,
+        val aliasLength: Int
+    )
+
+    private fun findFuzzyCatalogMatch(
+        text: String,
+        aliases: List<CompiledCatalogAlias>
+    ): TextMatch? {
+        val normalizedChars = mutableListOf<Char>()
+        val originalIndices = mutableListOf<Int>()
+        text.forEachIndexed { index, char ->
+            if (char.isLetterOrDigit()) {
+                normalizedChars += char.uppercaseChar()
+                originalIndices += index
+            }
+        }
+        if (normalizedChars.isEmpty()) return null
+
+        val source = normalizedChars.joinToString("")
+        val candidates = mutableListOf<FuzzyCandidate>()
+
+        for (alias in aliases) {
+            val target = alias.normalizedAlias
+            val maxDistance = when {
+                target.length < 5 -> 0
+                target.length <= 11 -> 1
+                else -> 2
+            }
+            if (maxDistance == 0 || target.length < 5) continue
+
+            val minLength = (target.length - maxDistance).coerceAtLeast(1)
+            val maxLength = target.length + maxDistance
+            for (start in source.indices) {
+                if (source[start] != target.first()) continue
+                for (length in minLength..maxLength) {
+                    val end = start + length
+                    if (end > source.length) continue
+                    val candidate = source.substring(start, end)
+                    val distance = editDistanceAtMost(target, candidate, maxDistance)
+                    if (distance > maxDistance) continue
+
+                    val originalStart = originalIndices[start]
+                    val originalEnd = originalIndices[end - 1] + 1
+                    val leftBoundaryIsValid =
+                        originalStart == 0 || !text[originalStart - 1].isLetterOrDigit()
+                    val rightBoundaryIsValid =
+                        originalEnd >= text.length || !text[originalEnd].isLetterOrDigit()
+                    if (!leftBoundaryIsValid || !rightBoundaryIsValid) continue
+
+                    candidates += FuzzyCandidate(
+                        match = TextMatch(
+                            name = alias.canonicalName,
+                            start = originalStart,
+                            endExclusive = originalEnd
+                        ),
+                        distance = distance,
+                        aliasLength = target.length
+                    )
+                }
+            }
+        }
+
+        if (candidates.isEmpty()) return null
+        val ranked = candidates.sortedWith(
+            compareBy<FuzzyCandidate> { it.distance }
+                .thenByDescending { it.aliasLength }
+        )
+        val best = ranked.first()
+        val tiedNames = ranked
+            .filter { it.distance == best.distance && it.aliasLength == best.aliasLength }
+            .map { it.match.name }
+            .distinct()
+        if (tiedNames.size > 1) return null
+        return best.match
+    }
+
+    private fun editDistanceAtMost(left: String, right: String, limit: Int): Int {
+        if (kotlin.math.abs(left.length - right.length) > limit) return limit + 1
+        var previous = IntArray(right.length + 1) { it }
+        for (i in left.indices) {
+            val current = IntArray(right.length + 1)
+            current[0] = i + 1
+            var rowMinimum = current[0]
+            for (j in right.indices) {
+                val cost = if (left[i] == right[j]) 0 else 1
+                current[j + 1] = minOf(
+                    current[j] + 1,
+                    previous[j + 1] + 1,
+                    previous[j] + cost
+                )
+                rowMinimum = minOf(rowMinimum, current[j + 1])
+            }
+            if (rowMinimum > limit) return limit + 1
+            previous = current
+        }
+        return previous[right.length]
     }
 
     /**

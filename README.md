@@ -1,3 +1,15 @@
+# Versi terbaru: 0.3.17 Offline — Fast Order Recognition
+
+Mulai dari [PETUNJUK_OFFLINE_0_3_17.md](PETUNJUK_OFFLINE_0_3_17.md) untuk build dan pengujian. Catatan 0.3.16 tetap tersedia sebagai riwayat baseline.
+
+# Update 0.3.15 — Tambahan Rak Kanan
+
+Petunjuk terbaru: [TAMBAHAN_RAK_KANAN.md](TAMBAHAN_RAK_KANAN.md).
+
+# Update 0.3.14 NPC Trial 2
+
+Petunjuk terbaru: [PETUNJUK_TRIAL2.md](PETUNJUK_TRIAL2.md).
+
 # Warung Auto Bag Assistant
 
 Fondasi proyek Android native berbasis Kotlin untuk Samsung Galaxy S24 dan Android.

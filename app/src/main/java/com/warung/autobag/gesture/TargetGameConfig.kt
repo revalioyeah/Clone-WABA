@@ -11,8 +11,8 @@ object TargetGameConfig {
 
     // Tap singkat; keberhasilan tetap diverifikasi melalui perubahan jumlah OCR.
     const val TAP_DURATION_MS: Long = 55L
-    const val TAP_INTERVAL_MS: Long = 35L
-    const val ITEM_SWITCH_DELAY_MS: Long = 45L
+    const val TAP_INTERVAL_MS: Long = 20L
+    const val ITEM_SWITCH_DELAY_MS: Long = 20L
     const val MAX_TAPS_PER_BATCH: Int = 5
     const val MAX_ITEM_TYPES_PER_SEQUENCE: Int = 8
 

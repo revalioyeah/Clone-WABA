@@ -71,7 +71,7 @@ class MainActivity : Activity() {
         private const val MAX_VERIFICATION_ATTEMPTS = 5
         private const val MAX_CAPTURE_WAIT_MS = 900L
         private const val FRAME_POLL_INTERVAL_MS = 25L
-        private const val COMPLETED_IDENTITY_SCAN_INTERVAL_MS = 300L
+        private const val COMPLETED_IDENTITY_SCAN_INTERVAL_MS = 600L
         private const val FIRST_VERIFICATION_DELAY_MS = 70L
         private const val GAME_SWITCH_DELAY_MS = 1_500L
         private const val CONTINUOUS_MONITOR_INTERVAL_MS = 90L
@@ -79,7 +79,7 @@ class MainActivity : Activity() {
         private const val CONTINUOUS_STABLE_FRAME_COUNT = 2
         private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 8
         private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 120L
-        private const val PRODUCT_LOCATION_CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val PRODUCT_LOCATION_CACHE_TTL_MS = 3 * 60 * 1000L
     }
 
     private lateinit var accessibilityStatusText: TextView
@@ -1464,22 +1464,22 @@ class MainActivity : Activity() {
         panelOcrResult: OcrResult,
         parsed: OrderParseResult
     ): Boolean {
-        if (parsed.items.size < 2) return false
-        val quantitiesComplete = parsed.items.all { item ->
-            item.currentQuantity != null &&
-                item.requiredQuantity != null &&
-                item.requiredQuantity > 0
-        }
-        if (!quantitiesComplete) return false
+        if (parsed.items.isEmpty()) return false
+        if (parsed.unmatchedQuantityCount > 0) return true
 
         val cropHeight = verificationRegion?.height() ?: return false
-        val quantityLinePattern = Regex("""[0-9Oo]+\s*[/|]\s*[0-9]+""")
-        val nearCropBottom = panelOcrResult.lines.any { line ->
+        if (cropHeight <= 0) return false
+
+        // Expand only when recognized content approaches the lower edge.
+        // Four correctly read rows alone are not a reason to run OCR twice.
+        val lowerContentThreshold = (cropHeight * 0.58f).toInt()
+        val hasContentNearBottom = panelOcrResult.lines.any { line ->
             line.text.isNotBlank() &&
-                line.bottom >= (cropHeight * 0.72f).toInt() &&
-                quantityLinePattern.containsMatchIn(line.text)
+                line.bottom >= lowerContentThreshold &&
+                line.top > 0
         }
-        return parsed.items.size >= 4 || (parsed.items.size >= 2 && nearCropBottom)
+
+        return hasContentNearBottom
     }
 
     private fun runExpandedPanelScan(
@@ -1596,9 +1596,9 @@ class MainActivity : Activity() {
             return
         }
 
-        // A compact 0.3.9-sized crop keeps ordinary 1–3 item orders fast.
-        // If at least four rows are visible (or three rows reach the crop edge),
-        // expand only this customer's scan so long orders are not truncated.
+        // Keep the compact crop for normal orders. Expand only when OCR text
+        // actually reaches the lower edge, not merely because four products
+        // happened to be recognized in the first pass.
         if (!expandedScan && shouldExpandPanelScan(panelOcrResult, parsed)) {
             runExpandedPanelScan(fullBitmap, captureModifiedAt)
             return
@@ -1626,6 +1626,7 @@ class MainActivity : Activity() {
         val completeExpandedOrder =
             expandedScan &&
                 parsed.items.size >= 3 &&
+                parsed.unmatchedQuantityCount == 0 &&
                 parsed.items.all { item ->
                     item.currentQuantity != null &&
                         item.requiredQuantity != null &&
@@ -1639,6 +1640,7 @@ class MainActivity : Activity() {
         // panel so a completed customer's order is never replayed.
         val completeNewOrder =
             parsed.items.isNotEmpty() &&
+                parsed.unmatchedQuantityCount == 0 &&
                 parsed.items.all { item ->
                     item.currentQuantity != null &&
                         item.requiredQuantity != null &&
@@ -1648,7 +1650,19 @@ class MainActivity : Activity() {
                 (
                     activeCustomerSignature == null ||
                         signature != activeCustomerSignature ||
-                        hadStablePanelGap
+                        hadStablePanelGap ||
+                        (
+                            signature == activeCustomerSignature &&
+                                isSameSignatureCounterReset(parsed) &&
+                                (
+                                    executionManager?.state == OrderExecutionManager.State.COMPLETED ||
+                                        (
+                                            executionManager?.state == OrderExecutionManager.State.PAUSED &&
+                                                autoPausedAwaitingPanel &&
+                                                !userPaused
+                                        )
+                                )
+                        )
                 )
 
         if (
@@ -1666,7 +1680,32 @@ class MainActivity : Activity() {
             return
         }
 
-        val managerState = executionManager?.state
+        var managerState = executionManager?.state
+
+        val sameSignatureReset =
+            signature == activeCustomerSignature &&
+                isSameSignatureCounterReset(parsed) &&
+                (
+                    managerState == OrderExecutionManager.State.COMPLETED ||
+                        (
+                            managerState == OrderExecutionManager.State.PAUSED &&
+                                autoPausedAwaitingPanel &&
+                                !userPaused
+                        )
+                )
+
+        if (sameSignatureReset) {
+            executionManager?.stop()
+            GestureAccessibilityService.instance?.cancelPendingTapBatch()
+            pendingVerification = null
+            autoPausedAwaitingPanel = false
+            activeCustomerSignature = null
+            activeCustomerLabel = null
+            lastServedCustomerSignature = null
+            managerState = executionManager?.state
+            executionStatusText.text =
+                "Pesanan identik muncul kembali dengan jumlah ter-reset. Pelanggan baru langsung diproses."
+        }
 
         if (
             managerState == OrderExecutionManager.State.PAUSED &&
@@ -1984,14 +2023,69 @@ class MainActivity : Activity() {
             candidateStableFrameCount = 1
         }
 
-        if (candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT) {
+        val completeNewOrder =
+            parsed.items.isNotEmpty() &&
+                parsed.unmatchedQuantityCount == 0 &&
+                parsed.items.all { item ->
+                    item.currentQuantity != null &&
+                        item.requiredQuantity != null &&
+                        item.requiredQuantity > 0 &&
+                        item.currentQuantity in 0..item.requiredQuantity
+                } &&
+                (
+                    activeCustomerSignature == null ||
+                        signature != activeCustomerSignature ||
+                        hadStablePanelGap ||
+                        (
+                            signature == activeCustomerSignature &&
+                                isSameSignatureCounterReset(parsed) &&
+                                (
+                                    executionManager?.state == OrderExecutionManager.State.COMPLETED ||
+                                        (
+                                            executionManager?.state == OrderExecutionManager.State.PAUSED &&
+                                                autoPausedAwaitingPanel &&
+                                                !userPaused
+                                        )
+                                )
+                        )
+                )
+
+        if (
+            candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT &&
+            !completeNewOrder
+        ) {
             executionStatusText.text =
                 "Panel pelanggan terdeteksi. Memastikan pesanan stabil (${candidateStableFrameCount}/${CONTINUOUS_STABLE_FRAME_COUNT})."
             scheduleContinuousMonitor(CONTINUOUS_MONITOR_INTERVAL_MS)
             return
         }
 
-        val managerState = executionManager?.state
+        var managerState = executionManager?.state
+
+        val sameSignatureReset =
+            signature == activeCustomerSignature &&
+                isSameSignatureCounterReset(parsed) &&
+                (
+                    managerState == OrderExecutionManager.State.COMPLETED ||
+                        (
+                            managerState == OrderExecutionManager.State.PAUSED &&
+                                autoPausedAwaitingPanel &&
+                                !userPaused
+                        )
+                )
+
+        if (sameSignatureReset) {
+            executionManager?.stop()
+            GestureAccessibilityService.instance?.cancelPendingTapBatch()
+            pendingVerification = null
+            autoPausedAwaitingPanel = false
+            activeCustomerSignature = null
+            activeCustomerLabel = null
+            lastServedCustomerSignature = null
+            managerState = executionManager?.state
+            executionStatusText.text =
+                "Pesanan identik muncul kembali dengan jumlah ter-reset. Pelanggan baru langsung diproses."
+        }
 
         val detectedCustomerLabel = extractCustomerLabel(result)
         if (
@@ -2098,6 +2192,13 @@ class MainActivity : Activity() {
         precomputedDetection: SmartDetectionResult? = null,
         useCustomerLabelFromResult: Boolean = true
     ) {
+        if (parsed.unmatchedQuantityCount > 0) {
+            executionStatusText.text =
+                "Ada ${parsed.unmatchedQuantityCount} baris jumlah tanpa nama barang yang cocok. Membaca ulang agar pesanan tidak diproses sebagian."
+            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            return
+        }
+
         val pendingOrders = parsed.items.filter { order ->
             val current = order.currentQuantity
             val required = order.requiredQuantity
@@ -2189,24 +2290,33 @@ class MainActivity : Activity() {
     ) {
         if (imageWidth <= 0 || imageHeight <= 0) return
 
-        val cacheAge = SystemClock.elapsedRealtime() - cachedLocationUpdatedAt
+        val now = SystemClock.elapsedRealtime()
+        val cacheAge = now - cachedLocationUpdatedAt
         val sameLayout =
             cachedLocationImageWidth == imageWidth &&
                 cachedLocationImageHeight == imageHeight
-        if (
-            !force &&
-            sameLayout &&
-            cachedProductLocations.isNotEmpty() &&
-            cacheAge in 0L..PRODUCT_LOCATION_CACHE_TTL_MS
-        ) {
-            return
-        }
+        val cacheExpired = cacheAge !in 0L..PRODUCT_LOCATION_CACHE_TTL_MS
+        val resetCache = force || !sameLayout || cacheExpired
 
-        if (force || !sameLayout) {
+        if (resetCache) {
             cachedProductLocations.clear()
         }
 
-        val catalogOrders = currentCatalogEntries().map { entry ->
+        // A fresh cache may still be incomplete (for example, a product label
+        // was too small in the first OCR frame). Re-scan only missing products
+        // instead of either doing nothing or reprocessing the entire catalog.
+        val entriesToScan = currentCatalogEntries().filter { entry ->
+            resetCache ||
+                normalizeItemName(entry.name) !in cachedProductLocations
+        }
+
+        if (entriesToScan.isEmpty()) {
+            cachedLocationImageWidth = imageWidth
+            cachedLocationImageHeight = imageHeight
+            return
+        }
+
+        val catalogOrders = entriesToScan.map { entry ->
             ParsedOrderItem(
                 name = entry.name,
                 currentQuantity = 0,
@@ -2220,21 +2330,23 @@ class MainActivity : Activity() {
             orders = catalogOrders,
             imageWidth = imageWidth,
             imageHeight = imageHeight,
-            catalogEntries = currentCatalogEntries()
+            catalogEntries = entriesToScan
         )
 
         allLocations.detections.forEach { detected ->
             cachedProductLocations[normalizeItemName(detected.itemName)] = detected
         }
+
         cachedLocationImageWidth = imageWidth
         cachedLocationImageHeight = imageHeight
-        cachedLocationUpdatedAt = SystemClock.elapsedRealtime()
+        if (allLocations.detections.isNotEmpty()) {
+            cachedLocationUpdatedAt = now
+        } else if (resetCache) {
+            // Keep the cache expired when a refresh could not find any labels.
+            cachedLocationUpdatedAt = 0L
+        }
     }
 
-    /**
-     * Rebuild detection data for a new order using cached shelf points.
-     * Returns null if even one pending product is missing from the cache.
-     */
     private fun buildDetectionFromLocationCache(
         parsed: OrderParseResult,
         imageWidth: Int,
@@ -2278,6 +2390,20 @@ class MainActivity : Activity() {
         )
     }
 
+    /**
+     * If the previous order was completed/held for recovery and the exact same
+     * item set returns with every counter reset to zero, it is a new customer
+     * even when the requested products and quantities are identical.
+     */
+    private fun isSameSignatureCounterReset(parsed: OrderParseResult): Boolean {
+        if (parsed.items.isEmpty() || parsed.unmatchedQuantityCount > 0) return false
+        return parsed.items.all { item ->
+            val current = item.currentQuantity
+            val required = item.requiredQuantity
+            current == 0 && required != null && required > 0
+        }
+    }
+
     private fun createCustomerSignature(parsed: OrderParseResult): String =
         parsed.items
             .map { item ->
@@ -2295,6 +2421,7 @@ class MainActivity : Activity() {
     private fun isPlausibleOrderChange(parsed: OrderParseResult): Boolean {
         val activeSignature = activeCustomerSignature ?: return true
         if (!parsed.headerFound || parsed.items.isEmpty()) return false
+        if (parsed.unmatchedQuantityCount > 0) return false
         if (parsed.items.any {
                 it.currentQuantity == null ||
                     it.requiredQuantity == null ||
@@ -2581,6 +2708,7 @@ class MainActivity : Activity() {
         singleItemOnly: Boolean
     ): List<OrderExecutionManager.OrderTask>? {
         if (!parsed.headerFound || parsed.items.isEmpty()) return null
+        if (parsed.unmatchedQuantityCount > 0) return null
         if (parsed.items.any { it.currentQuantity == null || it.requiredQuantity == null }) return null
 
         val pendingOrders = parsed.items.filter {

@@ -133,7 +133,7 @@ object GestureController {
 
     /**
      * Maps all cached product points once, then sends a short sequence across
-     * up to two different item types. The order panel is verified once after
+     * up to the configured number of item types. The order panel is verified once after
      * the complete sequence rather than after every product type.
      */
     fun executeTapSequenceFromImage(

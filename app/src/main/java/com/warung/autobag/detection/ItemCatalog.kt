@@ -254,6 +254,31 @@ object ItemCatalog {
             targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
         ),
 
+        CatalogEntry(
+            name = "Susu kotak",
+            aliases = listOf("Susu kotak", "Susukotak"),
+            shelfRegion = ShelfRegion.RIGHT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+        CatalogEntry(
+            name = "Es krim",
+            aliases = listOf("Es krim", "Eskrim"),
+            shelfRegion = ShelfRegion.RIGHT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+        CatalogEntry(
+            name = "Kurma",
+            aliases = listOf("Kurma"),
+            shelfRegion = ShelfRegion.RIGHT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+        CatalogEntry(
+            name = "Sirup",
+            aliases = listOf("Sirup"),
+            shelfRegion = ShelfRegion.RIGHT_SHELF,
+            targetOffsetYReferencePx = DEFAULT_TARGET_OFFSET_Y
+        ),
+
         // ---------------------------------------------------------
         // KONTER PULSA
         // ---------------------------------------------------------

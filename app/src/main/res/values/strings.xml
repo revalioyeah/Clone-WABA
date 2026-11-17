@@ -1,5 +1,5 @@
 <resources>
     <string name="app_name">Warung Auto Bag Assistant</string>
     <string name="accessibility_service_label">Warung Auto Bag Assistant</string>
-    <string name="accessibility_service_description">Layanan pendamping untuk menjalankan gesture yang diminta pengguna pada tahap pengembangan berikutnya. Layanan belum melakukan tindakan otomatis pada versi awal.</string>
+    <string name="accessibility_service_description">Menjalankan klik dan drag otomatis pada game saat Anda mengaktifkan mode warung atau minigame. Akses jendela digunakan untuk memeriksa game yang sedang dibuka. Pembacaan gambar menggunakan izin tangkapan layar terpisah dan OCR lokal. Aplikasi ini tidak memiliki izin Internet. Anda dapat menghentikan mode otomatis dan menonaktifkan layanan kapan saja.</string>
 </resources>

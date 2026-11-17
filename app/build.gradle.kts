@@ -12,8 +12,8 @@ android {
         applicationId = "com.warung.autobag"
         minSdk = 26
         targetSdk = 35
-        versionCode = 14
-        versionName = "0.3.14-npc-trial2"
+        versionCode = 17
+        versionName = "0.3.17-offline-fast-order"
     }
 
     compileOptions {
@@ -23,6 +23,26 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    // Release keys are supplied by the owner; never bundle a private key in source.
+    val releaseStore = System.getenv("WARUNG_KEYSTORE_PATH")
+    if (!releaseStore.isNullOrBlank()) {
+        signingConfigs.create("ownerRelease") {
+            storeFile = file(releaseStore)
+            storePassword = System.getenv("WARUNG_STORE_PASSWORD")
+            keyAlias = System.getenv("WARUNG_KEY_ALIAS")
+            keyPassword = System.getenv("WARUNG_KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            isDebuggable = false
+            isMinifyEnabled = false
+            if (!releaseStore.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("ownerRelease")
+            }
+        }
     }
 }
 
