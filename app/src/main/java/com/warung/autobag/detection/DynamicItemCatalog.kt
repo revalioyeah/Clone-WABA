@@ -145,5 +145,5 @@ object DynamicItemCatalog {
     }
 
     private fun normalize(value: String): String =
-        value.lowercase().filter { it.isLetterOrDigit() }
+        value.uppercase().filter { it.isLetterOrDigit() }
 }

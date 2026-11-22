@@ -427,7 +427,7 @@ class OrderExecutionManager(
     }
 
     private fun normalizeName(value: String): String =
-        value.lowercase().replace(Regex("[^a-z0-9]"), "")
+        value.uppercase().replace(Regex("[^A-Z0-9]"), "")
 
     private fun PixelPoint.isValid(): Boolean =
         x.isFinite() && y.isFinite() && x > 0f && y > 0f
