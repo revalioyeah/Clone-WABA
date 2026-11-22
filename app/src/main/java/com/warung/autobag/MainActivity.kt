@@ -3478,7 +3478,7 @@ class MainActivity : Activity() {
     }
 
     private fun normalizeItemName(value: String): String =
-        value.lowercase().filter { it.isLetterOrDigit() }
+        value.uppercase().filter { it.isLetterOrDigit() }
 
     private fun createHeading(text: String): TextView {
         return TextView(this).apply {
