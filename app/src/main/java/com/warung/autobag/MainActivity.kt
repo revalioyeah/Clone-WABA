@@ -82,6 +82,12 @@ class MainActivity : Activity() {
         private const val MAX_CONTINUOUS_PANEL_WAIT_ATTEMPTS = 8
         private const val CONTINUOUS_PANEL_RETRY_DELAY_MS = 120L
         private const val PRODUCT_LOCATION_CACHE_TTL_MS = 3 * 60 * 1000L
+
+        // Mode Battle: loop otomatis seperti minigame. Tidak ada tombol
+        // "Mulai" terpisah — switch ON langsung memulai pemantauan OCR dan tap.
+        private const val BATTLE_POLL_INTERVAL_MS = 180L
+        private const val BATTLE_IDLE_RETRY_MS = 100L
+        private const val BATTLE_STABLE_FRAME_COUNT = 2
     }
 
     private lateinit var accessibilityStatusText: TextView
@@ -444,6 +450,81 @@ class MainActivity : Activity() {
             battleModeEnabled = isChecked
             catalogEntriesCache = null // Invalidate cache so new entries take effect
             refreshCatalogSummary()
+            if (isChecked) {
+                // Mode Battle menyala -> mulai loop otomatis seperti minigame.
+                // Tidak butuh tombol "Mulai" manual, tidak butuh kalibrasi checkbox,
+                // tidak butuh latestDetection -- langsung jalan.
+                if (continuousModeEnabled) {
+                    executionStatusText.text = "Mode Battle tidak bisa diaktifkan sambil Mode Berkelanjutan berjalan."
+                    battleModeSwitch.setChecked(false)
+                    return@setOnCheckedChangeListener
+                }
+                if (npcAutomation != null) {
+                    executionStatusText.text = "Matikan switch minigame NPC sebelum mengaktifkan Mode Battle."
+                    battleModeSwitch.setChecked(false)
+                    return@setOnCheckedChangeListener
+                }
+                if (fishingSession != null) {
+                    executionStatusText.text = "Hentikan mode memancing sebelum mengaktifkan Mode Battle."
+                    battleModeSwitch.setChecked(false)
+                    return@setOnCheckedChangeListener
+                }
+                if (!ScreenCaptureService.isRunning) {
+                    executionStatusText.text = "Screen Capture belum aktif. Aktifkan terlebih dahulu."
+                    battleModeSwitch.setChecked(false)
+                    return@setOnCheckedChangeListener
+                }
+                if (GestureAccessibilityService.instance == null) {
+                    executionStatusText.text = "Gesture Accessibility Service belum aktif."
+                    battleModeSwitch.setChecked(false)
+                    return@setOnCheckedChangeListener
+                }
+                if (!TargetGameConfig.isConfigured) {
+                    executionStatusText.text = "Package game belum dikonfigurasi. Mode Battle tidak dapat dimulai."
+                    battleModeSwitch.setChecked(false)
+                    return@setOnCheckedChangeListener
+                }
+
+                // Hentikan monitor sebelumnya jika ada
+                if (continuousMonitorRunnable != null) {
+                    mainHandler.removeCallbacks(continuousMonitorRunnable)
+                    continuousMonitorRunnable = null
+                }
+                executionManager?.stop()
+
+                // Reset state untuk battle mode
+                continuousModeEnabled = true  // WAJIB: agar schedule/runContinuousMonitor tidak early-return
+                userPaused = false
+                autoPausedAwaitingPanel = false
+                pendingVerification = null
+                activeCustomerSignature = null
+                activeCustomerLabel = null
+                lastServedCustomerSignature = null
+                candidateCustomerSignature = null
+                candidateStableFrameCount = 0
+                panelAbsentFrameCount = 0
+                lastContinuousFrameModifiedAt = 0L
+                lastCompletedIdentityScanAt = 0L
+
+                ScreenCaptureService.setAutomationActive(true)
+
+                val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                battleTurn = prefs.getInt(BATTLE_TURN_KEY, 1)
+                executionStatusText.text = "MODE BATTLE AKTIF • Giliran Player $battleTurn • Menunggu game..."
+                updateCaptureNotification("BATTLE • Memantau panel pesanan")
+
+                // Jadwalkan monitor dengan interval khusus battle
+                scheduleContinuousMonitor(GAME_SWITCH_DELAY_MS)
+            } else {
+                // Mode Battle dimatikan -> hentikan monitor agar tidak ada tap lanjutan.
+                continuousModeEnabled = false
+                if (continuousMonitorRunnable != null) {
+                    mainHandler.removeCallbacks(continuousMonitorRunnable)
+                    continuousMonitorRunnable = null
+                }
+                executionManager?.stop()
+                executionStatusText.text = "Mode Battle dimatikan."
+            }
         }
         battleModeContainer.addView(battleModeText)
         battleModeContainer.addView(battleModeSwitch)
@@ -1303,6 +1384,7 @@ class MainActivity : Activity() {
     }
 
     private fun scheduleContinuousMonitor(delayMs: Long = CONTINUOUS_MONITOR_INTERVAL_MS) {
+        // Battle mode juga pakai continuousModeEnabled=true, jadi guard ini OK untuk keduanya.
         if (!continuousModeEnabled) return
         continuousMonitorRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable {
@@ -1315,25 +1397,33 @@ class MainActivity : Activity() {
 
     private fun runContinuousMonitor() {
         if (!continuousModeEnabled) return
-        if (userPaused) {
+
+        // Battle mode: skip userPaused check (auto loop tanpa pause manual)
+        if (userPaused && !battleModeEnabled) {
             executionStatusText.text = "MODE BERKELANJUTAN DIJEDA PENGGUNA. Tekan LANJUTKAN untuk meneruskan pemantauan."
             scheduleContinuousMonitor(700L)
             return
         }
 
         if (!ScreenCaptureService.isRunning) {
-            executionStatusText.text =
+            val msg = if (battleModeEnabled)
+                "MODE BATTLE MENUNGGU: Screen Capture tidak aktif. Aktifkan kembali capture."
+            else
                 "MODE BERKELANJUTAN MENUNGGU: Screen Capture tidak aktif. Aktifkan kembali capture."
-            scheduleContinuousMonitor(1_000L)
+            executionStatusText.text = msg
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else 1_000L)
             return
         }
 
         val accessibility = GestureAccessibilityService.instance
         if (accessibility == null || !accessibility.isTargetGameForeground()) {
-            executionStatusText.text =
+            val msg = if (battleModeEnabled)
+                "MODE BATTLE MENUNGGU: buka Warung Life Simulator agar panel pesanan dapat dipantau."
+            else
                 "MODE BERKELANJUTAN MENUNGGU: buka Warung Life Simulator agar panel pelanggan dapat dipantau."
-            updateCaptureNotification("MENUNGGU • Buka game untuk melanjutkan pemantauan")
-            scheduleContinuousMonitor(800L)
+            executionStatusText.text = msg
+            updateCaptureNotification(if (battleModeEnabled) "BATTLE MENUNGGU • Buka game" else "MENUNGGU • Buka game untuk melanjutkan pemantauan")
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else 800L)
             return
         }
 
@@ -1345,66 +1435,76 @@ class MainActivity : Activity() {
             isVerificationOcrRunning ||
             continuousScanInFlight
         ) {
-            scheduleContinuousMonitor(150L)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_POLL_INTERVAL_MS else 150L)
             return
         }
 
-        if (state == OrderExecutionManager.State.PAUSED && (!autoPausedAwaitingPanel || userPaused)) {
+        // Battle mode: tidak perlu check autoPausedAwaitingPanel
+        if (!battleModeEnabled && state == OrderExecutionManager.State.PAUSED && (!autoPausedAwaitingPanel || userPaused)) {
             scheduleContinuousMonitor(120L)
             return
         }
 
         val imageFile = File(filesDir, ScreenCaptureService.CAPTURE_FILE_NAME)
         if (!imageFile.exists()) {
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else CONTINUOUS_IDLE_RETRY_MS)
             return
         }
 
         val modifiedAt = imageFile.lastModified()
         if (modifiedAt <= lastContinuousFrameModifiedAt) {
-            scheduleContinuousMonitor(FRAME_POLL_INTERVAL_MS)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_POLL_INTERVAL_MS else FRAME_POLL_INTERVAL_MS)
             return
         }
         lastContinuousFrameModifiedAt = modifiedAt
 
         val fullBitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
         if (fullBitmap == null) {
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else CONTINUOUS_IDLE_RETRY_MS)
             return
         }
 
         val imageWidth = fullBitmap.width
         val imageHeight = fullBitmap.height
-        val panelRect = verificationRegion?.takeUnless { debtTapAttempted }?.let { Rect(it) }?.apply {
-            intersect(0, 0, imageWidth, imageHeight)
-        }
 
-        val panelBitmap = try {
-            if (
-                panelRect != null &&
-                panelRect.width() > 0 &&
-                panelRect.height() > 0 &&
-                (panelRect.width() < imageWidth || panelRect.height() < imageHeight)
-            ) {
-                Bitmap.createBitmap(
-                    fullBitmap,
-                    panelRect.left,
-                    panelRect.top,
-                    panelRect.width(),
-                    panelRect.height()
-                )
-            } else {
+        // Battle mode: selalu gunakan full-screen OCR (tidak crop panel) karena
+        // kita perlu deteksi item di seluruh rak (LEFT_SHELF + RIGHT_SHELF).
+        val scanBitmap: Bitmap
+        val usingPanelCrop: Boolean
+        if (battleModeEnabled) {
+            scanBitmap = fullBitmap
+            usingPanelCrop = false
+        } else {
+            val panelRect = verificationRegion?.takeUnless { debtTapAttempted }?.let { Rect(it) }?.apply {
+                intersect(0, 0, imageWidth, imageHeight)
+            }
+            val panelBitmap = try {
+                if (
+                    panelRect != null &&
+                    panelRect.width() > 0 &&
+                    panelRect.height() > 0 &&
+                    (panelRect.width() < imageWidth || panelRect.height() < imageHeight)
+                ) {
+                    Bitmap.createBitmap(
+                        fullBitmap,
+                        panelRect.left,
+                        panelRect.top,
+                        panelRect.width(),
+                        panelRect.height()
+                    )
+                } else {
+                    null
+                }
+            } catch (_: Exception) {
                 null
             }
-        } catch (_: Exception) {
-            null
+            scanBitmap = panelBitmap ?: fullBitmap
+            usingPanelCrop = panelBitmap != null
         }
 
-        val scanBitmap = panelBitmap ?: fullBitmap
-        val usingPanelCrop = panelBitmap != null
         continuousScanInFlight = true
         isOcrRunning = true
-        updateCaptureNotification("SCANNING • Membaca panel pesanan")
+        updateCaptureNotification(if (battleModeEnabled) "BATTLE SCANNING • Membaca panel pesanan" else "SCANNING • Membaca panel pesanan")
 
         val recognizer = textRecognizer
             ?: OrderTextRecognizer().also { textRecognizer = it }
@@ -2108,7 +2208,10 @@ class MainActivity : Activity() {
                         )
                 )
 
-        if (
+        // Battle mode: skip stability frame check, process immediately
+        if (battleModeEnabled) {
+            // Lanjut langsung ke startContinuousCustomerOrder tanpa menunggu frame stabil
+        } else if (
             candidateStableFrameCount < CONTINUOUS_STABLE_FRAME_COUNT &&
             !completeNewOrder
         ) {
@@ -2161,7 +2264,10 @@ class MainActivity : Activity() {
                 detectedCustomerLabel != null &&
                 !activeCustomerLabel.equals(detectedCustomerLabel, ignoreCase = true)
 
-        if (managerState == OrderExecutionManager.State.PAUSED && autoPausedAwaitingPanel && !userPaused) {
+        // Battle mode: skip customer identity change logic, just process orders
+        if (battleModeEnabled) {
+            // Lanjut langsung
+        } else if (managerState == OrderExecutionManager.State.PAUSED && autoPausedAwaitingPanel && !userPaused) {
             if (
                 customerIdentityChanged ||
                 (
@@ -2201,33 +2307,37 @@ class MainActivity : Activity() {
                 return
             }
         } else if (
-            managerState == OrderExecutionManager.State.PAUSED ||
-            managerState == OrderExecutionManager.State.RUNNING ||
-            managerState == OrderExecutionManager.State.WAITING_VERIFICATION
-        ) {
-            scheduleContinuousMonitor(120L)
-            return
-        }
+            // Battle mode: skip state checks that wait for customer changes
+        if (!battleModeEnabled) {
+            if (
+                managerState == OrderExecutionManager.State.PAUSED ||
+                managerState == OrderExecutionManager.State.RUNNING ||
+                managerState == OrderExecutionManager.State.WAITING_VERIFICATION
+            ) {
+                scheduleContinuousMonitor(120L)
+                return
+            }
 
-        if (
-            managerState == OrderExecutionManager.State.COMPLETED &&
-            signature == activeCustomerSignature &&
-            !customerIdentityChanged &&
-            !hadStablePanelGap
-        ) {
-            executionStatusText.text =
-                "Pesanan pelanggan ini sudah selesai. Menunggu pelanggan berikutnya."
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
-            return
-        }
+            if (
+                managerState == OrderExecutionManager.State.COMPLETED &&
+                signature == activeCustomerSignature &&
+                !customerIdentityChanged &&
+                !hadStablePanelGap
+            ) {
+                executionStatusText.text =
+                    "Pesanan pelanggan ini sudah selesai. Menunggu pelanggan berikutnya."
+                scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                return
+            }
 
-        if (
-            signature == lastServedCustomerSignature &&
-            !customerIdentityChanged &&
-            !hadStablePanelGap
-        ) {
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
-            return
+            if (
+                signature == lastServedCustomerSignature &&
+                !customerIdentityChanged &&
+                !hadStablePanelGap
+            ) {
+                scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+                return
+            }
         }
 
         startContinuousCustomerOrder(
@@ -2253,7 +2363,7 @@ class MainActivity : Activity() {
         if (parsed.unmatchedQuantityCount > 0) {
             executionStatusText.text =
                 "Ada ${parsed.unmatchedQuantityCount} baris jumlah tanpa nama barang yang cocok. Membaca ulang agar pesanan tidak diproses sebagian."
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else CONTINUOUS_IDLE_RETRY_MS)
             return
         }
 
@@ -2272,30 +2382,46 @@ class MainActivity : Activity() {
             latestCaptureModifiedAtOcr = captureModifiedAt
             executionStatusText.text =
                 "Panel pelanggan terdeteksi, tetapi seluruh jumlah pesanan sudah terpenuhi. Menunggu pelanggan berikutnya."
-            updateCaptureNotification("RUNNING • Menunggu pelanggan berikutnya")
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            updateCaptureNotification(if (battleModeEnabled) "BATTLE • Menunggu pelanggan berikutnya" else "RUNNING • Menunggu pelanggan berikutnya")
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else CONTINUOUS_IDLE_RETRY_MS)
             return
         }
 
         if (parsed.items.any { it.currentQuantity == null || it.requiredQuantity == null }) {
             executionStatusText.text =
                 "Pesanan terdeteksi, tetapi jumlah salah satu item belum terbaca lengkap. Menunggu pembacaan ulang."
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else CONTINUOUS_IDLE_RETRY_MS)
             return
         }
 
-        val detection = precomputedDetection ?: SmartItemDetector.detect(
-            ocrResult = result,
-            orders = parsed.items,
-            imageWidth = imageWidth,
-            imageHeight = imageHeight,
-            catalogEntries = currentCatalogEntries()
-        )
+        // Battle mode: gunakan cachedProductLocations dari full-screen scan
+        // karena SmartItemDetector.detect pada panel OCR akan salah (label di panel, bukan di rak).
+        val detection: SmartDetectionResult
+        if (battleModeEnabled) {
+            detection = buildBattleDetectionFromCache(parsed, imageWidth, imageHeight)
+            if (detection.detections.isEmpty() && detection.notFoundItems.isNotEmpty()) {
+                // Cache belum lengkap - lakukan full-screen scan untuk mengisi cache
+                rememberProductLocationCache(result, imageWidth, imageHeight, force = true)
+                executionStatusText.text =
+                    "MODE BATTLE: Cache lokasi rak belum lengkap. Melakukan pemindaian ulang untuk mengisi cache."
+                scheduleContinuousMonitor(BATTLE_IDLE_RETRY_MS)
+                return
+            }
+        } else {
+            detection = precomputedDetection ?: SmartItemDetector.detect(
+                ocrResult = result,
+                orders = parsed.items,
+                imageWidth = imageWidth,
+                imageHeight = imageHeight,
+                catalogEntries = currentCatalogEntries()
+            )
+        }
+
         val tasks = buildTasksFromSnapshot(parsed, detection, singleItemOnly = false)
         if (tasks == null) {
             executionStatusText.text =
                 "Pelanggan terdeteksi, tetapi lokasi satu atau lebih barang belum ditemukan. Sistem akan mencoba deteksi ulang; tidak ada gesture dikirim."
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else CONTINUOUS_IDLE_RETRY_MS)
             return
         }
         if (tasks.isEmpty()) {
@@ -2303,7 +2429,7 @@ class MainActivity : Activity() {
             activeCustomerLabel =
                 if (useCustomerLabelFromResult) extractCustomerLabel(result) else null
             lastServedCustomerSignature = signature
-            scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
+            scheduleContinuousMonitor(if (battleModeEnabled) BATTLE_IDLE_RETRY_MS else CONTINUOUS_IDLE_RETRY_MS)
             return
         }
 
@@ -2326,10 +2452,13 @@ class MainActivity : Activity() {
                     imageWidth = imageWidth,
                     imageHeight = imageHeight
                 )
-                ocrResultText.text = if (useCustomerLabelFromResult) buildRawOcrOutput(result) else "Pesanan dibaca dari panel; lokasi rak menggunakan cache hasil pemindaian awal."
+                ocrResultText.text = if (battleModeEnabled)
+                    "MODE BATTLE: Lokasi rak dari cache full-screen scan."
+                else if (useCustomerLabelFromResult) buildRawOcrOutput(result)
+                else "Pesanan dibaca dari panel; lokasi rak menggunakan cache hasil pemindaian awal."
                 executionStatusText.text =
                     "Pelanggan baru terdeteksi: ${tasks.size} jenis pesanan. Memulai eksekusi otomatis."
-                updateCaptureNotification("RUNNING • Memproses ${tasks.size} jenis barang")
+                updateCaptureNotification(if (battleModeEnabled) "BATTLE • Memproses ${tasks.size} jenis barang" else "RUNNING • Memproses ${tasks.size} jenis barang")
                 executionManager?.start(tasks, battleModeEnabled)
             }
         }
@@ -2445,6 +2574,51 @@ class MainActivity : Activity() {
             detections = detections,
             notFoundItems = emptyList(),
             message = "Lokasi ${detections.size} jenis barang diambil dari cache rak."
+        )
+    }
+
+    /**
+     * Battle mode: build detection result from cachedProductLocations.
+     * Item battle (Kopi susu, Teh botol, Mie rebus, dll) terletak di rak kiri/kanan,
+     * jadi gunakan lokasi yang sudah di-cache dari full-screen scan sebelumnya.
+     */
+    private fun buildBattleDetectionFromCache(
+        parsed: OrderParseResult,
+        imageWidth: Int,
+        imageHeight: Int
+    ): SmartDetectionResult {
+        val pendingOrders = parsed.items.filter { order ->
+            val current = order.currentQuantity
+            val required = order.requiredQuantity
+            current != null && required != null && current < required
+        }
+
+        val detections = mutableListOf<SmartDetectedItem>()
+        val notFound = mutableListOf<String>()
+
+        for (order in pendingOrders) {
+            val cached = cachedProductLocations[normalizeItemName(order.name)]
+            if (cached != null) {
+                detections += cached.copy(
+                    itemName = order.name,
+                    requestedQuantity = order.requiredQuantity,
+                    currentQuantity = order.currentQuantity,
+                    remainingQuantity = (
+                        order.requiredQuantity!! - order.currentQuantity!!
+                    ).coerceAtLeast(0)
+                )
+            } else {
+                notFound.add(order.name)
+            }
+        }
+
+        return SmartDetectionResult(
+            detections = detections,
+            notFoundItems = notFound,
+            message = if (detections.isNotEmpty())
+                "MODE BATTLE: Lokasi ${detections.size} barang dari cache rak. Belum ditemukan: ${notFound.joinToString(", ")}."
+            else
+                "MODE BATTLE: Cache rak kosong. Perlu pemindaian full-screen dulu."
         )
     }
 
