@@ -2306,8 +2306,7 @@ class MainActivity : Activity() {
                 scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
                 return
             }
-        } else if (
-            // Battle mode: skip state checks that wait for customer changes
+        // Battle mode: skip state checks that wait for customer changes
         if (!battleModeEnabled) {
             if (
                 managerState == OrderExecutionManager.State.PAUSED ||
