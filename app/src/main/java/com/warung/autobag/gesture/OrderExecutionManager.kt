@@ -1,4 +1,6 @@
 
+package com.warung.autobag.gesture
+
 /**
  * Coordinates a fast tap sequence across the products in one customer order.
  *

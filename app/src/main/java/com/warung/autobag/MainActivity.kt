@@ -1274,23 +1274,6 @@ class MainActivity : Activity() {
             executionStatusText.text = "Status: otomatisasi berkelanjutan dimulai."
         }
 
-        continuousModeEnabled = true
-        userPaused = false
-        lastContinuousFrameModifiedAt = 0L
-        lastCompletedIdentityScanAt = 0L
-        candidateCustomerSignature = null
-        candidateStableFrameCount = 0
-        panelAbsentFrameCount = 0
-        activeCustomerSignature = null
-        activeCustomerLabel = null
-        lastServedCustomerSignature = null
-        autoPausedAwaitingPanel = false
-
-        startContinuousMonitor()
-    }
-            return
-        }
-
         AlertDialog.Builder(this)
             .setTitle("Mulai mode otomatis berkelanjutan")
             .setMessage(
