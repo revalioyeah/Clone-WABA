@@ -12,7 +12,8 @@ package com.warung.autobag.gesture
  */
 class OrderExecutionManager(
     private val tapDispatcher: TapDispatcher,
-    private val listener: Listener
+    private val listener: Listener,
+    var battleModeEnabled: Boolean = false
 ) {
 
     data class PixelPoint(val x: Float, val y: Float)
@@ -129,7 +130,7 @@ class OrderExecutionManager(
         }
 
         runToken++
-        this.isBattleMode = battleMode
+        this.isBattleMode = battleMode || battleModeEnabled
         queue.clear()
         queue += tasks
             .filter { it.currentQuantity < it.requiredQuantity }
