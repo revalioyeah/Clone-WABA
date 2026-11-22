@@ -67,7 +67,7 @@ class MainActivity : Activity() {
         private const val ACCESSIBILITY_SETUP_SHOWN = "accessibility_setup_shown"
         private const val REQUEST_SCREEN_CAPTURE = 3101
         private const val REQUEST_POST_NOTIFICATIONS = 3102
-        private const val REFERENCE_IMAGE_WIDTH = 2304f
+        private const val REFERENCE_IMAGE_WIDTH = 2340f
         private const val MAX_VERIFICATION_ATTEMPTS = 5
         private const val MAX_CAPTURE_WAIT_MS = 900L
         private const val FRAME_POLL_INTERVAL_MS = 25L

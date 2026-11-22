@@ -36,10 +36,11 @@ data class SmartDetectionResult(
 object SmartItemDetector {
 
     /**
-     * Screenshot referensi game memiliki lebar sekitar 2304 piksel.
+     * Screenshot referensi game memiliki lebar sekitar 2340 piksel
+     * (2340x1080, DPI 270) untuk penyesuaian resolusi layar modern.
      * Offset target diskalakan mengikuti lebar gambar aktual.
      */
-    private const val REFERENCE_IMAGE_WIDTH = 2304f
+    private const val REFERENCE_IMAGE_WIDTH = 2340f
     // Pada konter, tulisan di kartu dan label di bawahnya dapat
     // menghasilkan alias yang sama. Keduanya mengarah ke baris kartu.
     private const val PULSE_CARD_OFFSET_Y = 76f
