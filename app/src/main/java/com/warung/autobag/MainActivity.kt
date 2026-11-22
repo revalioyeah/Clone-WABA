@@ -27,6 +27,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
+import android.view.Gravity
 import android.view.View
 import android.view.accessibility.AccessibilityManager
 import android.widget.ArrayAdapter
@@ -45,6 +46,7 @@ import com.warung.autobag.detection.SmartDetectionResult
 import com.warung.autobag.detection.SmartDetectedItem
 import com.warung.autobag.detection.ItemCatalog
 import com.warung.autobag.detection.DynamicItemCatalog
+import com.warung.autobag.detection.BattleItemCatalog
 import com.warung.autobag.detection.ShelfRegion
 import com.warung.autobag.detection.SmartItemDetector
 import com.warung.autobag.gesture.GestureAccessibilityService
@@ -100,6 +102,11 @@ class MainActivity : Activity() {
     private lateinit var executionStatusText: TextView
     private lateinit var catalogSummaryText: TextView
     private lateinit var calibrationCheckBox: CheckBox
+    // Battle Mode UI elements
+    private lateinit var battleModeContainer: LinearLayout
+    private lateinit var battleModeText: TextView
+    private lateinit var battleModeSwitch: Switch
+    private var battleModeEnabled = false
     private var latestParsedOrder: OrderParseResult? = null
     private var latestDetection: SmartDetectionResult? = null
     private var latestImageWidth = 0
@@ -415,6 +422,29 @@ class MainActivity : Activity() {
         ).apply { bottomMargin = dp(6) })
         orders.addView(calibrationCheckBox, marginParams(8))
         orders.addView(startAutomaticButton, marginParams(4))
+
+        battleModeContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        battleModeText = TextView(this).apply {
+            text = "Mode Battle"
+            textSize = 14f
+            setTextColor(Color.DKGRAY)
+            setPadding(dp(8), 0, dp(4), 0)
+        }
+        battleModeSwitch = Switch(this).apply {
+            setChecked(false)
+        }
+        battleModeSwitch.setOnCheckedChangeListener { _, isChecked ->
+            battleModeEnabled = isChecked
+            catalogEntriesCache = null // Invalidate cache so new entries take effect
+            refreshCatalogSummary()
+        }
+        battleModeContainer.addView(battleModeText)
+        battleModeContainer.addView(battleModeSwitch)
+        orders.addView(battleModeContainer, marginParams(4))
+
         orders.addView(controlRow(pauseAutomaticButton, resumeAutomaticButton, stopAutomaticButton), marginParams())
         warungPage.addView(orders, marginParams(10))
 
@@ -590,23 +620,38 @@ class MainActivity : Activity() {
     }
 
     private fun currentCatalogEntries(): List<com.warung.autobag.detection.CatalogEntry> {
-        return catalogEntriesCache ?: DynamicItemCatalog.allEntries(this).also {
+        return catalogEntriesCache ?: buildCatalogEntries().also {
             catalogEntriesCache = it
         }
     }
 
+    private fun buildCatalogEntries(): List<com.warung.autobag.detection.CatalogEntry> {
+        val base = DynamicItemCatalog.allEntries(this)
+        // Mode Battle memuat katalog tambahan tanpa mengubah menu warung asli.
+        // Hindari duplikasi: hanya tambahkan entri Battle yang nama-nya belum ada di base.
+        return if (battleModeEnabled) {
+            val baseNames = base.map { it.name }.toSet()
+            val battleUnique = BattleItemCatalog.entries.filter { it.name !in baseNames }
+            base + battleUnique
+        } else base
+    }
+
     private fun reloadCatalogEntries() {
-        catalogEntriesCache = DynamicItemCatalog.allEntries(this)
+        catalogEntriesCache = buildCatalogEntries()
     }
 
     private fun refreshCatalogSummary() {
         if (!::catalogSummaryText.isInitialized) return
         val custom = DynamicItemCatalog.customEntries(this)
-        val total = ItemCatalog.entries.size + custom.size
+        val battleCount = if (battleModeEnabled) BattleItemCatalog.entries.size else 0
+        val total = ItemCatalog.entries.size + custom.size + battleCount
         catalogSummaryText.text = buildString {
             append("Katalog bawaan: ${ItemCatalog.entries.size} barang\n")
             append("Barang tambahan tersimpan: ${custom.size}\n")
             append("Total barang dikenali: $total")
+            if (battleModeEnabled) {
+                append("\n\nMode Battle: aktif")
+            }
             if (custom.isNotEmpty()) {
                 append("\n\nTambahan: ")
                 append(custom.joinToString(", ") { it.name })
