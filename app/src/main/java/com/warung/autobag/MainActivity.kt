@@ -107,6 +107,10 @@ class MainActivity : Activity() {
     private lateinit var battleModeText: TextView
     private lateinit var battleModeSwitch: Switch
     private var battleModeEnabled = false
+    private var battleTurn = 1
+    private val PREFS_NAME = "WarungPrefs"
+    private val BATTLE_TURN_KEY = "battle_turn"
+
     private var latestParsedOrder: OrderParseResult? = null
     private var latestDetection: SmartDetectionResult? = null
     private var latestImageWidth = 0
@@ -850,6 +854,7 @@ class MainActivity : Activity() {
 
     private fun createExecutionManager() {
         executionManager = OrderExecutionManager(
+            battleModeEnabled = battleModeEnabled,
             tapDispatcher = OrderExecutionManager.TapDispatcher { commands, onComplete ->
                 if (latestImageWidth <= 0 || latestImageHeight <= 0) {
                     onComplete(false, "Ukuran screenshot terakhir belum tersedia.", List(commands.size) { 0 })
@@ -1258,6 +1263,31 @@ class MainActivity : Activity() {
         }
         if (!TargetGameConfig.isConfigured) {
             executionStatusText.text = "Package game belum dikonfigurasi. Mode otomatis tidak dapat dimulai."
+            return
+        }
+
+        if (battleModeEnabled) {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            battleTurn = prefs.getInt(BATTLE_TURN_KEY, 1)
+            executionStatusText.text = "Mode Battle Aktif • Giliran Player $battleTurn"
+        } else {
+            executionStatusText.text = "Status: otomatisasi berkelanjutan dimulai."
+        }
+
+        continuousModeEnabled = true
+        userPaused = false
+        lastContinuousFrameModifiedAt = 0L
+        lastCompletedIdentityScanAt = 0L
+        candidateCustomerSignature = null
+        candidateStableFrameCount = 0
+        panelAbsentFrameCount = 0
+        activeCustomerSignature = null
+        activeCustomerLabel = null
+        lastServedCustomerSignature = null
+        autoPausedAwaitingPanel = false
+
+        startContinuousMonitor()
+    }
             return
         }
 
@@ -2317,7 +2347,7 @@ class MainActivity : Activity() {
                 executionStatusText.text =
                     "Pelanggan baru terdeteksi: ${tasks.size} jenis pesanan. Memulai eksekusi otomatis."
                 updateCaptureNotification("RUNNING • Memproses ${tasks.size} jenis barang")
-                executionManager?.start(tasks)
+                executionManager?.start(tasks, battleModeEnabled)
             }
         }
     }
@@ -2730,7 +2760,7 @@ class MainActivity : Activity() {
                         executionStatusText.text = "Tidak ada item yang masih perlu diambil pada panel terbaru."
                         return@recognize
                     }
-                    executionManager?.start(tasks)
+                    executionManager?.start(tasks, battleModeEnabled)
                 },
                 onFailure = { exception ->
                     if (!bitmap.isRecycled) bitmap.recycle()

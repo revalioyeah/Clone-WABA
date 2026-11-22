@@ -1,4 +1,3 @@
-package com.warung.autobag.gesture
 
 /**
  * Coordinates a fast tap sequence across the products in one customer order.
@@ -88,13 +87,14 @@ class OrderExecutionManager(
     private var pendingTargets = emptyList<VerificationTarget>()
     private var pauseRequested = false
     private var runToken = 0
+    private var isBattleMode = false
     private var dispatchedTaps = 0
     private var message = "Mesin eksekusi belum dimulai."
 
     var state: State = State.IDLE
         private set
 
-    fun start(tasks: List<OrderTask>) {
+    fun start(tasks: List<OrderTask>, battleMode: Boolean = false) {
         if (
             state == State.RUNNING ||
             state == State.WAITING_VERIFICATION ||
@@ -127,6 +127,7 @@ class OrderExecutionManager(
         }
 
         runToken++
+        this.isBattleMode = battleMode
         queue.clear()
         queue += tasks
             .filter { it.currentQuantity < it.requiredQuantity }
@@ -317,19 +318,39 @@ class OrderExecutionManager(
             val remaining = (task.requiredQuantity - task.currentQuantity).coerceAtLeast(0)
             TapCommand(
                 source = task.source,
-                tapCount = minOf(remaining, TargetGameConfig.MAX_TAPS_PER_BATCH).coerceAtLeast(1)
+                tapCount = if (isBattleMode) remaining else minOf(remaining, TargetGameConfig.MAX_TAPS_PER_BATCH).coerceAtLeast(1)
             )
         }
 
         val token = runToken
         tapInFlight = true
         pendingTargets = emptyList()
-        publish("Memproses ${selectedTasks.size} jenis barang dalam satu urutan tap, lalu memverifikasi semuanya sekaligus.")
+        if (isBattleMode) {
+            publish("MODE BATTLE: Mengirim semua tap sekaligus untuk ${selectedTasks.size} barang.")
+        } else {
+            publish("Memproses ${selectedTasks.size} jenis barang dalam satu urutan tap, lalu memverifikasi semuanya sekaligus.")
+        }
 
         try {
             tapDispatcher.dispatch(commands) { success, detail, completedCounts ->
                 if (token != runToken || state == State.STOPPED) return@dispatch
                 tapInFlight = false
+
+                if (isBattleMode) {
+                    selectedTasks.forEachIndexed { index, task ->
+                        val sent = completedCounts.getOrNull(index) ?: 0
+                        task.currentQuantity += sent
+                        dispatchedTaps += sent
+                    }
+                    if (queue.all { it.currentQuantity >= it.requiredQuantity }) {
+                        state = State.COMPLETED
+                        publish("MODE BATTLE: Selesai.")
+                    } else {
+                        advanceTaskIndex()
+                        dispatchCurrentGroup()
+                    }
+                    return@dispatch
+                }
 
                 val targets = mutableListOf<VerificationTarget>()
                 selectedTasks.forEachIndexed { index, task ->

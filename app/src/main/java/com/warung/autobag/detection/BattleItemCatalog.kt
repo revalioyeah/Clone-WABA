@@ -55,4 +55,20 @@ object BattleItemCatalog {
             targetOffsetYReferencePx = 55
         )
     )
+
+    fun find(itemName: String): CatalogEntry? {
+        val normalizedName = normalize(itemName)
+
+        return entries.firstOrNull { entry ->
+            entry.aliases.any { alias ->
+                normalize(alias) == normalizedName
+            } || normalize(entry.name) == normalizedName
+        }
+    }
+
+    private fun normalize(value: String): String {
+        return value
+            .uppercase()
+            .filter { it.isLetterOrDigit() }
+    }
 }
