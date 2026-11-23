@@ -2306,6 +2306,8 @@ class MainActivity : Activity() {
                 scheduleContinuousMonitor(CONTINUOUS_IDLE_RETRY_MS)
                 return
             }
+        }
+
         // Battle mode: skip state checks that wait for customer changes
         if (!battleModeEnabled) {
             if (
