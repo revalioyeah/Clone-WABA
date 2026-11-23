@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.warung.autobag"
-    compileSdk = 35
+    compileSdk = 33
 
     defaultConfig {
         applicationId = "com.warung.autobag"
