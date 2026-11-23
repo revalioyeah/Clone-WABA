@@ -486,8 +486,8 @@ class MainActivity : Activity() {
                 }
 
                 // Hentikan monitor sebelumnya jika ada
-                if (continuousMonitorRunnable != null) {
-                    mainHandler.removeCallbacks(continuousMonitorRunnable)
+                continuousMonitorRunnable?.let {
+                    mainHandler.removeCallbacks(it)
                     continuousMonitorRunnable = null
                 }
                 executionManager?.stop()
@@ -518,8 +518,8 @@ class MainActivity : Activity() {
             } else {
                 // Mode Battle dimatikan -> hentikan monitor agar tidak ada tap lanjutan.
                 continuousModeEnabled = false
-                if (continuousMonitorRunnable != null) {
-                    mainHandler.removeCallbacks(continuousMonitorRunnable)
+                continuousMonitorRunnable?.let {
+                    mainHandler.removeCallbacks(it)
                     continuousMonitorRunnable = null
                 }
                 executionManager?.stop()
@@ -4153,7 +4153,17 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun marginParams(
+    private fun createHeading(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 18f
+            setTextColor(Color.rgb(25, 65, 38))
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(dp(0), dp(16), dp(0), dp(4))
+        }
+    }
+
+    fun marginParams(
         bottom: Int = 0
     ): LinearLayout.LayoutParams {
         return LinearLayout.LayoutParams(
@@ -4164,7 +4174,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun dp(value: Int): Int {
+    fun dp(value: Int): Int {
         return (
             value * resources.displayMetrics.density
             ).toInt()
