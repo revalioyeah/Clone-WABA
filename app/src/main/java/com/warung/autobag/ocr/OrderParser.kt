@@ -168,6 +168,26 @@ object OrderParser {
         .sortedByDescending { it.aliasLength }
 
     /**
+     * Hitung Region of Interest (ROI) dari hasil OCR sebelumnya,
+     * sehingga frame berikutnya bisa di-crop terlebih dahulu untuk mempercepat OCR.
+     */
+    fun calculateBoardRoi(result: OcrResult): android.graphics.Rect? {
+        val header = result.lines.firstOrNull { line ->
+            normalize(line.text).contains("PESANAN")
+        } ?: return null
+
+        val headerWidth = (header.right - header.left).coerceAtLeast(1)
+        val horizontalPadding = (headerWidth * BOARD_HORIZONTAL_PADDING_RATIO).toInt()
+
+        val minX = (header.left - horizontalPadding).coerceAtLeast(0)
+        val maxX = header.right + horizontalPadding
+        val minY = header.top.coerceAtLeast(0)
+        val maxY = header.bottom + BOARD_VERTICAL_RANGE
+
+        return android.graphics.Rect(minX, minY, maxX, maxY)
+    }
+
+    /**
      * Fungsi utama parsing papan pesanan.
      */
     fun parse(

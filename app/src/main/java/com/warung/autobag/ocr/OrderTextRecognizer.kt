@@ -61,6 +61,7 @@ class OrderTextRecognizer {
 
     fun recognize(
         bitmap: Bitmap,
+        roi: Rect? = null,
         onSuccess: (OcrResult) -> Unit,
         onFailure: (Exception) -> Unit
     ) {
@@ -71,7 +72,22 @@ class OrderTextRecognizer {
 
         var ocrBitmap: Bitmap? = null
         try {
-            val maxDimension = maxOf(bitmap.width, bitmap.height)
+            // Apply ROI crop if present
+            val croppedBitmap = if (roi != null) {
+                val safeLeft = roi.left.coerceIn(0, bitmap.width - 1)
+                val safeTop = roi.top.coerceIn(0, bitmap.height - 1)
+                val safeWidth = roi.width().coerceAtMost(bitmap.width - safeLeft)
+                val safeHeight = roi.height().coerceAtMost(bitmap.height - safeTop)
+                if (safeWidth > 0 && safeHeight > 0) {
+                    Bitmap.createBitmap(bitmap, safeLeft, safeTop, safeWidth, safeHeight)
+                } else {
+                    bitmap
+                }
+            } else {
+                bitmap
+            }
+
+            val maxDimension = maxOf(croppedBitmap.width, croppedBitmap.height)
             val scale = if (maxDimension > MAX_OCR_DIMENSION) {
                 MAX_OCR_DIMENSION.toFloat() / maxDimension.toFloat()
             } else {
@@ -80,13 +96,13 @@ class OrderTextRecognizer {
 
             val inputBitmap = if (scale < 1f) {
                 Bitmap.createScaledBitmap(
-                    bitmap,
-                    (bitmap.width * scale).roundToInt().coerceAtLeast(1),
-                    (bitmap.height * scale).roundToInt().coerceAtLeast(1),
+                    croppedBitmap,
+                    (croppedBitmap.width * scale).roundToInt().coerceAtLeast(1),
+                    (croppedBitmap.height * scale).roundToInt().coerceAtLeast(1),
                     true
                 ).also { ocrBitmap = it }
             } else {
-                bitmap
+                croppedBitmap
             }
 
             val inputImage = InputImage.fromBitmap(inputBitmap, 0)
@@ -94,11 +110,16 @@ class OrderTextRecognizer {
                 .addOnSuccessListener { visionText ->
                     try {
                         val inverseScale = if (scale < 1f) 1f / scale else 1f
-                        val result = toOcrResult(visionText, inverseScale)
+                        val offsetX = if (roi != null) roi.left else 0
+                        val offsetY = if (roi != null) roi.top else 0
+                        val result = toOcrResult(visionText, inverseScale, offsetX, offsetY)
                         onSuccess(result)
                     } catch (exception: Exception) {
                         onFailure(exception)
                     } finally {
+                        if (croppedBitmap != bitmap && !croppedBitmap.isRecycled) {
+                            croppedBitmap.recycle()
+                        }
                         ocrBitmap?.let {
                             if (!it.isRecycled) it.recycle()
                         }
@@ -123,17 +144,19 @@ class OrderTextRecognizer {
 
     private fun toOcrResult(
         visionText: Text,
-        inverseScale: Float
+        inverseScale: Float,
+        offsetX: Int = 0,
+        offsetY: Int = 0
     ): OcrResult {
         val recognizedLines = visionText.textBlocks.flatMap { block ->
             block.lines.mapNotNull lineLoop@{ line ->
                 val bounds = line.boundingBox ?: return@lineLoop null
-                val lineBounds = scaleRect(bounds, inverseScale)
+                val lineBounds = scaleRect(bounds, inverseScale, offsetX, offsetY)
 
                 val recognizedElements = line.elements.mapNotNull elementLoop@{ element ->
                     val elementBounds = element.boundingBox
                         ?: return@elementLoop null
-                    val scaled = scaleRect(elementBounds, inverseScale)
+                    val scaled = scaleRect(elementBounds, inverseScale, offsetX, offsetY)
 
                     RecognizedElement(
                         text = element.text,
@@ -161,12 +184,12 @@ class OrderTextRecognizer {
         )
     }
 
-    private fun scaleRect(rect: Rect, factor: Float): Rect =
+    private fun scaleRect(rect: Rect, factor: Float, offsetX: Int = 0, offsetY: Int = 0): Rect =
         Rect(
-            (rect.left * factor).roundToInt(),
-            (rect.top * factor).roundToInt(),
-            (rect.right * factor).roundToInt(),
-            (rect.bottom * factor).roundToInt()
+            (rect.left * factor).roundToInt() + offsetX,
+            (rect.top * factor).roundToInt() + offsetY,
+            (rect.right * factor).roundToInt() + offsetX,
+            (rect.bottom * factor).roundToInt() + offsetY
         )
 
     fun close() {

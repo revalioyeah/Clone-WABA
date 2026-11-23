@@ -3482,12 +3482,15 @@ class MainActivity : Activity() {
     private fun normalizeItemName(value: String): String =
         value.uppercase().filter { it.isLetterOrDigit() }
 
-    private fun createHeading(text: String): TextView {
+    private fun createHeading(text: String, size: Float = 14f): TextView {
         return TextView(this).apply {
             this.text = text
-            textSize = 14f
+            textSize = size
             setTextColor(Color.rgb(25, 65, 38))
             typeface = android.graphics.Typeface.DEFAULT_BOLD
+            if (size > 14f) {
+                setPadding(dp(0), dp(16), dp(0), dp(4))
+            }
         }
     }
 
@@ -4153,16 +4156,6 @@ class MainActivity : Activity() {
         displayedBitmap = null
 
         super.onDestroy()
-    }
-
-    private fun createHeading(text: String): TextView {
-        return TextView(this).apply {
-            this.text = text
-            textSize = 18f
-            setTextColor(Color.rgb(25, 65, 38))
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setPadding(dp(0), dp(16), dp(0), dp(4))
-        }
     }
 
     fun marginParams(
