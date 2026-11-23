@@ -49,8 +49,8 @@ object OrderParser {
     // Padding mengikuti lebar tulisan PESANAN agar tetap proporsional
     // pada screenshot dengan resolusi berbeda. Nilai 1,5 menjaga isi
     // kedua sisi panel tetap terbaca tanpa menjangkau rak kanan.
-    private const val BOARD_HORIZONTAL_PADDING_RATIO = 1.5f
-    private const val BOARD_VERTICAL_RANGE = 520
+    private const val BOARD_HORIZONTAL_PADDING_RATIO = 1.2f
+    private const val BOARD_VERTICAL_RANGE = 400
 
     // Jarak vertikal maksimum agar angka tidak dipasangkan
     // dengan barang pada baris yang terlalu jauh.
@@ -361,6 +361,9 @@ object OrderParser {
                     ?: return@mapNotNull null
                 val quantity = quantityFragments.getOrNull(quantityIndex)
                     ?: return@mapNotNull null
+
+                // Pastikan requiredQuantity valid (bukan null atau zero yang tidak masuk akal)
+                if (quantity.required <= 0) return@mapNotNull null
 
                 ParsedOrderItem(
                     name = item.name,
