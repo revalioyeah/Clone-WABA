@@ -11,7 +11,7 @@ android {
     defaultConfig {
         applicationId = "com.warung.autobag"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 33
         versionCode = 17
         versionName = "0.3.17-offline-fast-order"
     }
